@@ -72,6 +72,93 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
     }
 }
 
+/**
+ * Wire protocol version. Bumped for V3, which replaced the base64-in-JSON
+ * encryption envelope with a binary frame. A V3 peer cannot talk to a 2.x peer,
+ * so the handshake refuses mismatched versions rather than corrupting a vault.
+ */
+export const PROTOCOL_VERSION = 3;
+
+/** Messages that carry a large binary body in a single named field. */
+const BINARY_BODY_FIELD: Record<string, 'data' | 'content'> = {
+    'file-chunk-data': 'data',
+    'file-batch-binary': 'data',
+    'encrypted-frame': 'data',
+    'file-update': 'content',
+};
+
+/**
+ * Split a message into its small JSON header and its bulk binary body, so the
+ * body can be carried as raw bytes instead of being base64'd into the JSON.
+ * Returns a null body for messages that have no binary payload.
+ */
+export function splitBinaryPayload(msg: any): { header: any; body: Uint8Array | null } {
+    const field = msg && typeof msg === 'object' ? BINARY_BODY_FIELD[msg.type] : undefined;
+    if (!field) return { header: msg, body: null };
+
+    const value = msg[field];
+    if (!(value instanceof ArrayBuffer) && !(value instanceof Uint8Array)) {
+        return { header: msg, body: null };
+    }
+    // 'file-update' only travels as binary when its encoding says so; a utf8
+    // update keeps its string content in the header.
+    if (msg.type === 'file-update' && msg.encoding !== 'binary' && msg.encoding !== 'base64') {
+        return { header: msg, body: null };
+    }
+
+    const { [field]: _omitted, ...header } = msg;
+    const body = value instanceof Uint8Array ? value : new Uint8Array(value);
+    return { header, body };
+}
+
+/** Reattach a binary body to the field its message type expects. */
+export function joinBinaryPayload(header: any, body: ArrayBuffer | null): any {
+    if (!body || !header || typeof header !== 'object') return header;
+    const field = BINARY_BODY_FIELD[header.type];
+    if (field) header[field] = body;
+    return header;
+}
+
+/**
+ * Pack a header + optional binary body into one buffer:
+ *   [4B headerLen LE][header JSON UTF-8][body bytes]
+ * This is the plaintext form; the encrypted path encrypts the whole thing at once.
+ */
+export function packFrame(header: any, body: Uint8Array | null): Uint8Array {
+    const headerBytes = textEncoder.encode(JSON.stringify(header));
+    const bodyLen = body ? body.byteLength : 0;
+    const out = new Uint8Array(4 + headerBytes.byteLength + bodyLen);
+    new DataView(out.buffer).setUint32(0, headerBytes.byteLength, true);
+    out.set(headerBytes, 4);
+    if (body) out.set(body, 4 + headerBytes.byteLength);
+    return out;
+}
+
+/** Inverse of packFrame. Throws a PROTOCOL_ERROR SyncError on a truncated frame. */
+export function unpackFrame(buffer: ArrayBuffer): { header: any; body: ArrayBuffer | null } {
+    if (buffer.byteLength < 4) {
+        throw new SyncError(
+            SyncErrorCategory.PROTOCOL_ERROR,
+            `Frame too short (${buffer.byteLength} bytes)`,
+            false,
+            'Re-request the message.'
+        );
+    }
+    const headerLen = new DataView(buffer).getUint32(0, true);
+    if (4 + headerLen > buffer.byteLength) {
+        throw new SyncError(
+            SyncErrorCategory.PROTOCOL_ERROR,
+            `Frame header length (${headerLen}) exceeds buffer size (${buffer.byteLength})`,
+            false,
+            'Re-request the message.'
+        );
+    }
+    const header = JSON.parse(textDecoder.decode(new Uint8Array(buffer, 4, headerLen)));
+    const bodyStart = 4 + headerLen;
+    const body = bodyStart < buffer.byteLength ? buffer.slice(bodyStart) : null;
+    return { header, body };
+}
+
 export interface PackedFile {
     path: string;
     mtime: number;

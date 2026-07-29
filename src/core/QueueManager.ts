@@ -1,4 +1,5 @@
 import { TimeoutManager } from '../utils/Timeouts';
+import { MAX_QUEUE_DEPTH } from '../../types';
 
 export interface QueueItem {
     id?: string;
@@ -75,7 +76,6 @@ export class QueueManager {
     }
 
     public getQueuePressure(): number {
-        const MAX_QUEUE_DEPTH = 100; // Configurable
         return Math.min(1, (this.syncQueue.length + this.activeQueueTransfers) / MAX_QUEUE_DEPTH);
     }
 

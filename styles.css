@@ -1,0 +1,134 @@
+/* Obsidian Decentralized — plugin styles.
+   Loaded automatically by Obsidian from the plugin directory. Previously these
+   rules were injected at runtime via style.innerHTML from main.ts and ui.ts. */
+
+/* --- Status bar & transfer progress (was main.ts injectStatusBarStyles) --- */
+.lucide-spin {
+    animation: od-spin 2s linear infinite;
+}
+@keyframes od-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+.od-status-icon {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 6px;
+}
+.od-status-icon svg {
+    width: 14px;
+    height: 14px;
+}
+.od-status-icon {
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 6px;
+}
+.od-status-container {
+    display: flex;
+    align-items: center;
+    line-height: 1;
+}
+.od-status-container:hover {
+    color: var(--text-normal);
+}
+body.od-hide-native-sync .status-bar-item.plugin-sync {
+    display: none !important;
+}
+.od-status-container.mod-clickable { cursor: pointer; }
+.od-progress-modal .od-transfer-item { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); }
+.od-progress-modal .od-transfer-meta { display: flex; justify-content: space-between; font-size: 0.85em; color: var(--text-muted); margin-top: 6px; }
+.od-progress-modal progress { width: 100%; height: 6px; border-radius: var(--radius-s); overflow: hidden; border: none; background: var(--background-modifier-border); margin-top: 8px; }
+.od-progress-modal progress::-webkit-progress-bar { background: var(--background-modifier-border); }
+.od-progress-modal progress::-webkit-progress-value { background: var(--interactive-accent); transition: width 0.2s ease; }
+.od-transfer-icon { display: inline-flex; align-items: center; vertical-align: middle; color: var(--text-muted); }
+.od-transfer-icon svg { width: 14px; height: 14px; }
+
+.od-editable-name-container {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-s);
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+.od-editable-name-container:hover {
+    border-color: var(--background-modifier-border);
+    background-color: var(--background-primary-alt);
+}
+.od-editable-name-icon { color: var(--text-muted); opacity: 0.5; display: flex; }
+.od-editable-name-container:hover .od-editable-name-icon { opacity: 1; }
+.od-editable-name-input { margin: 0; height: 28px; background: var(--background-modifier-form-field); border: 1px solid var(--background-modifier-border-focus); border-radius: var(--radius-s); color: var(--text-normal); }
+.od-editable-name-submit { color: var(--interactive-success); cursor: pointer; display: flex; padding: 4px; border-radius: var(--radius-s); transition: background-color 0.15s; }
+.od-editable-name-submit:hover { background-color: var(--background-modifier-hover); }
+.od-setting-item-name-wrapper { display: flex; align-items: center; }
+
+/* --- Connection / pairing modal (was ui.ts injectStyles) --- */
+.od-dashboard-header { text-align: center; margin-bottom: 5px; font-weight: 600; color: var(--text-normal); }
+.od-dashboard-subtitle { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px; }
+.od-id-container { background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
+.od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 0 0 1px var(--interactive-accent); }
+.od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 15px; margin-bottom: 10px; }
+.od-section-divider { height: 1px; background: var(--background-modifier-border); margin: 25px 0; }
+.od-peer-list { display: flex; flex-direction: column; gap: 8px; }
+.od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
+.od-peer-item:hover { background: var(--background-modifier-hover); }
+.od-peer-item .info { display: flex; flex-direction: column; }
+.od-peer-item .sub-text { font-size: 0.8em; color: var(--text-muted); margin-top: 2px; }
+.od-mode-switch { margin-top: 40px; text-align: center; font-size: 0.85em; color: var(--text-muted); cursor: pointer; text-decoration: none; opacity: 0.7; transition: opacity 0.2s; }
+.od-mode-switch:hover { opacity: 1; text-decoration: underline; }
+.od-input-row { display: flex; gap: 10px; margin-bottom: 5px; }
+.od-input-row input { flex-grow: 1; }
+.od-right-align { display: flex; justify-content: flex-end; }
+
+.od-id-name { font-weight: bold; margin-bottom: 4px; }
+.od-id-value { font-size: 0.9em; color: var(--text-muted); }
+.od-scanning { color: var(--text-muted); font-style: italic; display: flex; align-items: center; justify-content: center; padding: 20px; }
+.od-peer-name { font-weight: bold; }
+.od-full-width { width: 100%; }
+.od-ip-display { font-size: 1.2em; text-align: center; margin: 10px; }
+.od-pin-display { font-size: 2em; font-weight: bold; text-align: center; margin: 20px; }
+.od-text-muted { color: var(--text-muted); }
+
+/* Tabs & Banner */
+.od-connection-tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 10px; }
+.od-tab-btn { background: transparent; border: none; box-shadow: none; color: var(--text-muted); font-weight: 600; cursor: pointer; padding: 6px 16px; border-radius: var(--radius-s); transition: all 0.2s; }
+.od-tab-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.od-tab-btn.active { color: var(--text-normal); background: var(--background-modifier-active-hover); }
+
+.od-status-banner { padding: 12px; border-radius: var(--radius-m); margin-bottom: 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 8px; }
+.od-status-banner.idle { background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); color: var(--text-muted); }
+.od-status-banner.connecting { background: var(--background-modifier-hover); color: var(--text-normal); }
+.od-status-banner.reconnecting { background: rgba(255, 160, 0, 0.12); border: 1px solid rgba(255, 160, 0, 0.4); color: #c97d00; }
+.od-status-banner.connected { background: var(--background-modifier-success); color: var(--text-success); border: 1px solid var(--background-modifier-success-hover); }
+.od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
+
+/* Quick Pair specifics */
+.od-step-header { font-size: 1.1em; font-weight: 600; color: var(--text-normal); margin-top: 20px; margin-bottom: 10px; }
+.od-pairing-code-container { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); border: 1px solid var(--background-modifier-border); margin: 10px 0; }
+.od-pairing-code-text { font-family: var(--font-monospace); font-size: 1.5em; font-weight: bold; letter-spacing: 0.05em; color: var(--text-normal); user-select: all; }
+.od-instruction-text { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px; }
+
+.od-qr-section { display: flex; flex-direction: column; align-items: center; margin-top: 15px; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
+.od-qr-section img { width: 150px; height: 150px; border-radius: var(--radius-s); margin-bottom: 10px; }
+.od-qr-label { font-size: 0.9em; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
+
+.od-lan-card { padding: 15px; background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); cursor: pointer; transition: all 0.2s; text-align: center; display: flex; flex-direction: column; gap: 4px; }
+.od-lan-card:hover { border-color: var(--interactive-accent); background: var(--background-modifier-hover); transform: translateY(-1px); }
+.od-pulsing-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--interactive-accent); animation: pulse 1.5s infinite; margin-right: 8px; }
+@keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.5); } 100% { opacity: 1; transform: scale(1); } }
+
+/* Responsive & Platform Specifics */
+.od-desktop .od-full-width { width: auto; min-width: 200px; display: block; margin: 10px auto; }
+.od-desktop .od-direct-ip-wrapper { max-width: 400px; margin: 0 auto; }
+.od-desktop .od-direct-ip-wrapper input { margin-bottom: 10px; width: 100%; }
+.od-desktop .od-id-container { max-width: 500px; margin: 0 auto; }
+.od-desktop .od-peer-list { max-width: 600px; margin: 0 auto; }
+.od-desktop .od-section-title { text-align: center; max-width: 600px; margin-left: auto; margin-right: auto; }
+.od-desktop .od-input-row { max-width: 500px; margin: 0 auto 10px auto; }
+
+.od-mobile .od-full-width { width: 100%; margin-top: 10px; }
+.od-mobile .od-input-row { flex-direction: column; }
+.od-mobile .od-input-row button { width: 100%; margin-top: 5px; }

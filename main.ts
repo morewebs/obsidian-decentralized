@@ -87,14 +87,17 @@ import {
     base64ToArrayBuffer,
     packFilesToTLV,
     unpackTLVToFiles,
-    PackedFile
+    PackedFile,
+    PROTOCOL_VERSION,
+    splitBinaryPayload,
+    joinBinaryPayload,
+    packFrame,
+    unpackFrame
 } from './utils';
 
 import { TimeoutManager } from './src/utils/Timeouts';
 import { QueueManager } from './src/core/QueueManager';
 import { ConnectionManager } from './src/core/ConnectionManager';
-import { FileManager } from './src/core/FileManager';
-import { SyncEngine } from './src/core/SyncEngine';
 
 export default class ObsidianDecentralizedPlugin extends Plugin {
     settings: ObsidianDecentralizedSettings;
@@ -108,8 +111,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public timeoutManager: TimeoutManager;
     public queueManager: QueueManager;
     public connectionManager: ConnectionManager;
-    public fileManager: FileManager;
-    public syncEngine: SyncEngine;
 
 
     public syncState: SyncState = {
@@ -212,8 +213,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     async onload() {
         // Initialize Core Managers
         this.timeoutManager = new TimeoutManager();
-        this.syncEngine = new SyncEngine(this.timeoutManager);
-        this.fileManager = new FileManager(this.app.vault);
         this.connectionManager = new ConnectionManager(this.timeoutManager);
         this.queueManager = new QueueManager(this.timeoutManager, async (item) => {
             try {
@@ -236,7 +235,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         await this.loadSettings();
         this.applyHideNativeSync();
-        this.injectStatusBarStyles();
         this.statusBar = this.addStatusBarItem();
         this.addSettingTab(new ObsidianDecentralizedSettingTab(this.app, this));
         this.conflictCenter = new ConflictCenter(this.app, this);
@@ -289,7 +287,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         // Safely destroy all background timeouts and queue processes
         this.queueManager.clear();
-        this.fileManager.destroy();
         this.timeoutManager.clearAll();
 
         this.saveState(); // Force immediate save on unload instead of debounced delay
@@ -736,63 +733,76 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return arrayBufferToBase64(exported);
     }
 
-    async encryptPayload(data: any, pskBase64: string): Promise<any> {
+    /**
+     * Imported AES-GCM keys, cached per peer. Previously every single message —
+     * including every 512 KB chunk — re-derived the key from base64 and called
+     * importKey, which dominated the cost of encrypted transfers.
+     */
+    private cryptoKeys: Map<string, CryptoKey> = new Map();
+
+    private async getCryptoKey(peerId: string): Promise<CryptoKey | null> {
+        const cached = this.cryptoKeys.get(peerId);
+        if (cached) return cached;
+        const psk = this.settings.peerKeys[peerId];
+        if (!psk) return null;
+        const key = await window.crypto.subtle.importKey(
+            'raw', base64ToArrayBuffer(psk), { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']
+        );
+        this.cryptoKeys.set(peerId, key);
+        return key;
+    }
+
+    /** Drop a cached key so a rotated or removed PSK is never reused. */
+    public invalidateCryptoKey(peerId?: string) {
+        if (peerId) this.cryptoKeys.delete(peerId);
+        else this.cryptoKeys.clear();
+    }
+
+    /**
+     * Encrypt a message into the V3 wire envelope: { type:'encrypted-frame', data }
+     * where data is [12B IV][AES-GCM ciphertext] and the plaintext is a single
+     * packFrame buffer of [headerLen][header JSON][raw binary body].
+     *
+     * Binary bodies stay binary end to end. The 2.x envelope base64'd them into
+     * JSON and then base64'd the ciphertext again, inflating the wire by ~33% and
+     * copying the buffer three extra times per message.
+     */
+    async encryptPayload(data: any, peerId: string): Promise<any> {
+        const key = await this.getCryptoKey(peerId);
+        if (!key) throw new Error(`No encryption key for peer ${peerId}`);
         try {
-            const keyData = base64ToArrayBuffer(pskBase64);
-            const key = await window.crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['encrypt']);
+            const { header, body } = splitBinaryPayload(data);
+            const plaintext = packFrame(header, body);
             const iv = window.crypto.getRandomValues(new Uint8Array(12));
-            let encoded: Uint8Array;
-            const isFileChunkData = data.type === 'file-chunk-data' && data.data instanceof ArrayBuffer;
-            const isFileUpdate = data.type === 'file-update' && data.content instanceof ArrayBuffer;
-            const isFileBatchBinary = data.type === 'file-batch-binary' && data.data instanceof ArrayBuffer;
-            
-            if (isFileChunkData || isFileUpdate || isFileBatchBinary) {
-                const originalData = isFileChunkData ? data.data : (isFileUpdate ? data.content : data.data);
-                const base64Data = arrayBufferToBase64(originalData);
-                const modifiedData = { ...data };
-                if (isFileChunkData || isFileBatchBinary) modifiedData.data = base64Data;
-                else modifiedData.content = base64Data;
-                modifiedData._wasBinary = true;
-                encoded = ObsidianDecentralizedPlugin.textEncoder.encode(JSON.stringify(modifiedData));
-            } else {
-                encoded = ObsidianDecentralizedPlugin.textEncoder.encode(JSON.stringify(data));
-            }
-            const encrypted = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
-            
-            return {
-                type: 'encrypted',
-                iv: arrayBufferToBase64(iv.buffer),
-                data: arrayBufferToBase64(encrypted)
-            };
+            const ciphertext = await window.crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
+
+            const framed = new Uint8Array(12 + ciphertext.byteLength);
+            framed.set(iv, 0);
+            framed.set(new Uint8Array(ciphertext), 12);
+            return { type: 'encrypted-frame', data: framed.buffer };
         } catch (e) {
-            // Never fall back to plaintext — throw so the caller can surface the error and halt the send
-            this.log("Encryption failed", e);
+            // Never fall back to plaintext — throw so the caller halts the send.
+            this.log('Encryption failed', e);
             throw new Error(`Encryption failed: ${e instanceof Error ? e.message : String(e)}`);
         }
     }
 
-    async decryptPayload(encryptedPayload: any, pskBase64: string): Promise<any> {
+    async decryptPayload(encryptedPayload: any, peerId: string): Promise<any> {
+        const key = await this.getCryptoKey(peerId);
+        if (!key) throw new Error(`No decryption key for peer ${peerId}`);
+        const raw = encryptedPayload.data;
+        const buf: ArrayBuffer = raw instanceof ArrayBuffer
+            ? raw
+            : (raw as Uint8Array).buffer.slice((raw as Uint8Array).byteOffset, (raw as Uint8Array).byteOffset + (raw as Uint8Array).byteLength);
+        if (buf.byteLength < 13) throw new Error('Decryption failed: frame too short');
         try {
-            const keyData = base64ToArrayBuffer(pskBase64);
-            const key = await window.crypto.subtle.importKey('raw', keyData, { name: 'AES-GCM' }, false, ['decrypt']);
-            const iv = base64ToArrayBuffer(encryptedPayload.iv);
-            const data = base64ToArrayBuffer(encryptedPayload.data);
-            
-            const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv: new Uint8Array(iv) }, key, data);
-            const decoded = ObsidianDecentralizedPlugin.textDecoder.decode(decrypted);
-            const parsed = JSON.parse(decoded);
-            if (parsed._wasBinary) {
-                if (parsed.type === 'file-chunk-data' || parsed.type === 'file-batch-binary') {
-                    parsed.data = base64ToArrayBuffer(parsed.data);
-                } else if (parsed.type === 'file-update') {
-                    parsed.content = base64ToArrayBuffer(parsed.content);
-                }
-                delete parsed._wasBinary;
-            }
-            return parsed;
+            const iv = new Uint8Array(buf, 0, 12);
+            const decrypted = await window.crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, buf.slice(12));
+            const { header, body } = unpackFrame(decrypted);
+            return joinBinaryPayload(header, body);
         } catch (e) {
-            this.log("Decryption failed", e);
-            throw new Error("Decryption failed");
+            this.log('Decryption failed', e);
+            throw new Error('Decryption failed');
         }
     }
 
@@ -1231,7 +1241,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             } else {
                 let finalPayload = data;
                 if (this.settings.enableEncryption && peerId && this.settings.peerKeys[peerId]) {
-                    finalPayload = await this.encryptPayload(data, this.settings.peerKeys[peerId]);
+                    finalPayload = await this.encryptPayload(data, peerId);
                 }
 
                 const isBatchItem = item.task && (item.task as any).batchId;
@@ -1320,7 +1330,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     peersToSend.forEach(async pId => {
                         let pPayload = data;
                         if (this.settings.enableEncryption && this.settings.peerKeys[pId]) {
-                            pPayload = await this.encryptPayload(data, this.settings.peerKeys[pId]);
+                            pPayload = await this.encryptPayload(data, pId);
                         }
                         const conn = this.connections.get(pId);
                         if (conn?.open) { conn.send(pPayload); }
@@ -1642,7 +1652,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     // wrapping it again produced a payload the receiver could never
                     // decrypt (raw.iv/raw.data undefined), so every encrypted
                     // reconnect handshake was silently dropped.
-                    const encrypted = await this.encryptPayload(payload, this.settings.peerKeys[conn.peer]);
+                    const encrypted = await this.encryptPayload(payload, conn.peer);
                     conn.send(encrypted);
                 } catch(e) {
                     this.log("Failed to encrypt handshake", e);
@@ -1709,30 +1719,45 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleRawIncomingData(raw: any, conn: DataConnection) {
         let data = raw;
+
+        // A 2.x peer sends the old base64-in-JSON envelope. It is unreadable here and
+        // the version gate in handleHandshake cannot fire (the handshake itself may be
+        // encrypted), so name the cause instead of silently dropping every message.
         if (raw && raw.type === 'encrypted') {
+            this.showNotice(
+                'A peer is running an older, incompatible version of Obsidian Decentralized. Update it to sync.',
+                'error', 10000
+            );
+            conn.close();
+            return;
+        }
+
+        if (raw && raw.type === 'encrypted-frame') {
             if (this.settings.peerKeys[conn.peer]) {
                 try {
-                    data = await this.decryptPayload(raw, this.settings.peerKeys[conn.peer]);
+                    data = await this.decryptPayload(raw, conn.peer);
                 } catch(e) {
                     this.log("Decryption failed, ignoring message", e);
                     return;
                 }
-            } else {
-                if (this.activePsk) {
-                    try {
-                        data = await this.decryptPayload(raw, this.activePsk);
-                        // Decryption succeeded! This peer used the active QR code PSK.
-                        this.settings.peerKeys[conn.peer] = this.activePsk;
-                        await this.saveSettings();
-                        this.log(`Successfully authenticated new peer ${conn.peer} via active PSK`);
-                    } catch(e) {
-                        this.log("Received encrypted message but no PSK found for peer, and active PSK failed", conn.peer);
-                        return;
-                    }
-                } else {
-                    this.log("Received encrypted message but no PSK found for peer", conn.peer);
+            } else if (this.activePsk) {
+                // A peer pairing via the active QR code has no stored key yet. Adopt the
+                // active PSK provisionally, and roll it back if it does not decrypt.
+                this.settings.peerKeys[conn.peer] = this.activePsk;
+                this.invalidateCryptoKey(conn.peer);
+                try {
+                    data = await this.decryptPayload(raw, conn.peer);
+                    await this.saveSettings();
+                    this.log(`Successfully authenticated new peer ${conn.peer} via active PSK`);
+                } catch(e) {
+                    delete this.settings.peerKeys[conn.peer];
+                    this.invalidateCryptoKey(conn.peer);
+                    this.log("Received encrypted message but no PSK found for peer, and active PSK failed", conn.peer);
                     return;
                 }
+            } else {
+                this.log("Received encrypted message but no PSK found for peer", conn.peer);
+                return;
             }
         }
         this.processIncomingData(data, conn);
@@ -2383,13 +2408,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector };
             if (isDirectIp) {
                 let encPayload: any = startPayload;
-                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, this.settings.peerKeys[peerId]);
+                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, peerId);
                 if (this.directIpClient) this.directIpClient.send(encPayload);
                 else if (this.directIpServer) this.directIpServer.sendTo(peerId, encPayload);
             }
             else {
                 let encPayload: any = startPayload;
-                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, this.settings.peerKeys[peerId]);
+                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, peerId);
                 conn!.send(encPayload);
             }
             this.resetIdleTimeout();
@@ -2423,7 +2448,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
                 
                 let encPayload: any = chunkPayload;
-                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(chunkPayload, this.settings.peerKeys[peerId]);
+                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(chunkPayload, peerId);
 
                 this.syncState.bytesTransferred += chunk.byteLength;
 
@@ -3844,77 +3869,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin });
     }
     
-    injectStatusBarStyles() {
-        const styleId = 'obsidian-decentralized-status-styles';
-        const existing = document.getElementById(styleId);
-        if (existing) existing.remove();
-        const style = document.createElement('style');
-        style.id = styleId;
-        style.innerHTML = `
-            .lucide-spin {
-                animation: od-spin 2s linear infinite;
-            }
-            @keyframes od-spin {
-                from { transform: rotate(0deg); }
-                to { transform: rotate(360deg); }
-            }
-            .od-status-icon {
-                display: inline-flex;
-                align-items: center;
-                margin-right: 6px;
-            }
-            .od-status-icon svg {
-                width: 14px;
-                height: 14px;
-            }
-            .od-status-icon {
-                display: inline-block;
-                vertical-align: middle;
-                margin-right: 6px;
-            }
-            .od-status-container {
-                display: flex;
-                align-items: center;
-                line-height: 1;
-            }
-            .od-status-container:hover {
-                color: var(--text-normal);
-            }
-            body.od-hide-native-sync .status-bar-item.plugin-sync {
-                display: none !important;
-            }
-            .od-status-container.mod-clickable { cursor: pointer; }
-            .od-progress-modal .od-transfer-item { margin-bottom: 15px; padding-bottom: 10px; border-bottom: 1px solid var(--background-modifier-border); }
-            .od-progress-modal .od-transfer-meta { display: flex; justify-content: space-between; font-size: 0.85em; color: var(--text-muted); margin-top: 6px; }
-            .od-progress-modal progress { width: 100%; height: 6px; border-radius: var(--radius-s); overflow: hidden; border: none; background: var(--background-modifier-border); margin-top: 8px; }
-            .od-progress-modal progress::-webkit-progress-bar { background: var(--background-modifier-border); }
-            .od-progress-modal progress::-webkit-progress-value { background: var(--interactive-accent); transition: width 0.2s ease; }
-            .od-transfer-icon { display: inline-flex; align-items: center; vertical-align: middle; color: var(--text-muted); }
-            .od-transfer-icon svg { width: 14px; height: 14px; }
-            
-            .od-editable-name-container {
-                display: inline-flex;
-                align-items: center;
-                gap: 8px;
-                padding: 4px 8px;
-                border: 1px solid transparent;
-                border-radius: var(--radius-s);
-                cursor: pointer;
-                transition: all 0.2s ease;
-            }
-            .od-editable-name-container:hover {
-                border-color: var(--background-modifier-border);
-                background-color: var(--background-primary-alt);
-            }
-            .od-editable-name-icon { color: var(--text-muted); opacity: 0.5; display: flex; }
-            .od-editable-name-container:hover .od-editable-name-icon { opacity: 1; }
-            .od-editable-name-input { margin: 0; height: 28px; background: var(--background-modifier-form-field); border: 1px solid var(--background-modifier-border-focus); border-radius: var(--radius-s); color: var(--text-normal); }
-            .od-editable-name-submit { color: var(--interactive-success); cursor: pointer; display: flex; padding: 4px; border-radius: var(--radius-s); transition: background-color 0.15s; }
-            .od-editable-name-submit:hover { background-color: var(--background-modifier-hover); }
-            .od-setting-item-name-wrapper { display: flex; align-items: center; }
-        `;
-        document.head.appendChild(style);
-    }
 
     public calculateStatus(): SyncStatusState {
         if (this.syncState.isSyncing) {

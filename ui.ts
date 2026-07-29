@@ -1,10 +1,26 @@
 import { App, Modal, Platform, Setting, TFile, Notice, setIcon } from 'obsidian';
 import { DataConnection } from 'peerjs';
 import DiffMatchPatch from 'diff-match-patch';
-import * as QRCode from 'qrcode';
-import { Html5Qrcode } from 'html5-qrcode';
+import type * as QRCodeType from 'qrcode';
+import type { Html5Qrcode as Html5QrcodeType } from 'html5-qrcode';
 import type ObsidianDecentralizedPlugin from './main';
 import { PeerInfo } from './types';
+
+// The QR generator and scanner together account for over half the bundle, yet they
+// are only reachable from the pairing modal. Importing them dynamically keeps their
+// module-level initialisation (notably html5-qrcode's ZXing tables) off the plugin
+// startup path — it now runs the first time a user actually opens pairing.
+let qrCodeModule: typeof QRCodeType | null = null;
+async function loadQRCode(): Promise<typeof QRCodeType> {
+    if (!qrCodeModule) qrCodeModule = await import('qrcode');
+    return qrCodeModule;
+}
+
+let html5QrcodeCtor: typeof Html5QrcodeType | null = null;
+async function loadHtml5Qrcode(): Promise<typeof Html5QrcodeType> {
+    if (!html5QrcodeCtor) html5QrcodeCtor = (await import('html5-qrcode')).Html5Qrcode;
+    return html5QrcodeCtor;
+}
 
 export function formatBytes(bytes: number, decimals = 2) {
     if (!Number.isFinite(bytes) || bytes <= 0) return '0 Bytes';
@@ -28,7 +44,6 @@ export class ConnectionModal extends Modal {
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
     async onOpen() {
-        this.injectStyles();
         this.contentEl.addClass(Platform.isMobile ? 'od-mobile' : 'od-desktop');
         
         if (this.plugin.connections && this.plugin.connections.size > 0) {
@@ -73,88 +88,6 @@ export class ConnectionModal extends Modal {
         this.contentEl.empty();
     }
 
-    injectStyles() {
-        const styleId = 'obsidian-decentralized-styles';
-        const existing = document.getElementById(styleId);
-        if (existing) return;
-        const style = document.createElement('style');
-        style.id = styleId;
-        
-        // Ensure it is removed when plugin unloads
-        this.plugin.register(() => {
-            const s = document.getElementById(styleId);
-            if (s) s.remove();
-        });
-        style.innerHTML = `
-            .od-dashboard-header { text-align: center; margin-bottom: 5px; font-weight: 600; color: var(--text-normal); }
-            .od-dashboard-subtitle { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 20px; }
-            .od-id-container { background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); user-select: all; font-family: var(--font-monospace); cursor: pointer; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--background-modifier-border); transition: all 0.2s ease; }
-            .od-id-container:hover { border-color: var(--interactive-accent); box-shadow: 0 0 0 1px var(--interactive-accent); }
-            .od-section-title { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; color: var(--text-muted); margin-top: 15px; margin-bottom: 10px; }
-            .od-section-divider { height: 1px; background: var(--background-modifier-border); margin: 25px 0; }
-            .od-peer-list { display: flex; flex-direction: column; gap: 8px; }
-            .od-peer-item { padding: 12px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); display: flex; align-items: center; justify-content: space-between; transition: background 0.1s; }
-            .od-peer-item:hover { background: var(--background-modifier-hover); }
-            .od-peer-item .info { display: flex; flex-direction: column; }
-            .od-peer-item .sub-text { font-size: 0.8em; color: var(--text-muted); margin-top: 2px; }
-            .od-mode-switch { margin-top: 40px; text-align: center; font-size: 0.85em; color: var(--text-muted); cursor: pointer; text-decoration: none; opacity: 0.7; transition: opacity 0.2s; }
-            .od-mode-switch:hover { opacity: 1; text-decoration: underline; }
-            .od-input-row { display: flex; gap: 10px; margin-bottom: 5px; }
-            .od-input-row input { flex-grow: 1; }
-            .od-right-align { display: flex; justify-content: flex-end; }
-
-            .od-id-name { font-weight: bold; margin-bottom: 4px; }
-            .od-id-value { font-size: 0.9em; color: var(--text-muted); }
-            .od-scanning { color: var(--text-muted); font-style: italic; display: flex; align-items: center; justify-content: center; padding: 20px; }
-            .od-peer-name { font-weight: bold; }
-            .od-full-width { width: 100%; }
-            .od-ip-display { font-size: 1.2em; text-align: center; margin: 10px; }
-            .od-pin-display { font-size: 2em; font-weight: bold; text-align: center; margin: 20px; }
-            .od-text-muted { color: var(--text-muted); }
-
-            /* Tabs & Banner */
-            .od-connection-tabs { display: flex; justify-content: center; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 10px; }
-            .od-tab-btn { background: transparent; border: none; box-shadow: none; color: var(--text-muted); font-weight: 600; cursor: pointer; padding: 6px 16px; border-radius: var(--radius-s); transition: all 0.2s; }
-            .od-tab-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
-            .od-tab-btn.active { color: var(--text-normal); background: var(--background-modifier-active-hover); }
-            
-            .od-status-banner { padding: 12px; border-radius: var(--radius-m); margin-bottom: 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 8px; }
-            .od-status-banner.idle { background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); color: var(--text-muted); }
-            .od-status-banner.connecting { background: var(--background-modifier-hover); color: var(--text-normal); }
-            .od-status-banner.reconnecting { background: rgba(255, 160, 0, 0.12); border: 1px solid rgba(255, 160, 0, 0.4); color: #c97d00; }
-            .od-status-banner.connected { background: var(--background-modifier-success); color: var(--text-success); border: 1px solid var(--background-modifier-success-hover); }
-            .od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
-
-            /* Quick Pair specifics */
-            .od-step-header { font-size: 1.1em; font-weight: 600; color: var(--text-normal); margin-top: 20px; margin-bottom: 10px; }
-            .od-pairing-code-container { display: flex; align-items: center; justify-content: center; gap: 10px; background: var(--background-modifier-form-field); padding: 15px; border-radius: var(--radius-m); border: 1px solid var(--background-modifier-border); margin: 10px 0; }
-            .od-pairing-code-text { font-family: var(--font-monospace); font-size: 1.5em; font-weight: bold; letter-spacing: 0.05em; color: var(--text-normal); user-select: all; }
-            .od-instruction-text { text-align: center; color: var(--text-muted); font-size: 0.9em; margin-bottom: 15px; }
-            
-            .od-qr-section { display: flex; flex-direction: column; align-items: center; margin-top: 15px; padding: 15px; background: var(--background-primary); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); }
-            .od-qr-section img { width: 150px; height: 150px; border-radius: var(--radius-s); margin-bottom: 10px; }
-            .od-qr-label { font-size: 0.9em; color: var(--text-muted); margin-bottom: 8px; font-weight: 600; }
-            
-            .od-lan-card { padding: 15px; background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); border-radius: var(--radius-m); cursor: pointer; transition: all 0.2s; text-align: center; display: flex; flex-direction: column; gap: 4px; }
-            .od-lan-card:hover { border-color: var(--interactive-accent); background: var(--background-modifier-hover); transform: translateY(-1px); }
-            .od-pulsing-indicator { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--interactive-accent); animation: pulse 1.5s infinite; margin-right: 8px; }
-            @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.5; transform: scale(1.5); } 100% { opacity: 1; transform: scale(1); } }
-
-            /* Responsive & Platform Specifics */
-            .od-desktop .od-full-width { width: auto; min-width: 200px; display: block; margin: 10px auto; }
-            .od-desktop .od-direct-ip-wrapper { max-width: 400px; margin: 0 auto; }
-            .od-desktop .od-direct-ip-wrapper input { margin-bottom: 10px; width: 100%; }
-            .od-desktop .od-id-container { max-width: 500px; margin: 0 auto; }
-            .od-desktop .od-peer-list { max-width: 600px; margin: 0 auto; }
-            .od-desktop .od-section-title { text-align: center; max-width: 600px; margin-left: auto; margin-right: auto; }
-            .od-desktop .od-input-row { max-width: 500px; margin: 0 auto 10px auto; }
-            
-            .od-mobile .od-full-width { width: 100%; margin-top: 10px; }
-            .od-mobile .od-input-row { flex-direction: column; }
-            .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
-        `;
-        document.head.appendChild(style);
-    }
 
     formatPairingCodeForDisplay(deviceId: string): string {
         if (deviceId.startsWith('device-')) {
@@ -324,12 +257,14 @@ export class ConnectionModal extends Modal {
         qrSection.createDiv({ text: 'Or scan QR code (Includes Encryption Key)', cls: 'od-qr-label' });
         
         const imgEl = qrSection.createEl('img');
-        QRCode.toDataURL(qrPayload, { width: 150, margin: 2 }).then(url => {
-            imgEl.src = url;
-        }).catch(err => {
-            imgEl.remove();
-            qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
-        });
+        loadQRCode()
+            .then(QRCode => QRCode.toDataURL(qrPayload, { width: 150, margin: 2 }))
+            .then(url => {
+                imgEl.src = url;
+            }).catch(err => {
+                imgEl.remove();
+                qrSection.createEl('p', { text: 'Failed to load QR code.', cls: 'od-text-muted' });
+            });
         
         const scanBtn = qrSection.createEl('button', { text: 'Scan QR Code', cls: 'od-full-width' });
         scanBtn.onclick = () => {
@@ -522,21 +457,25 @@ export class ConnectionModal extends Modal {
 }
 
 export class QRScannerModal extends Modal {
-    private html5QrCode: Html5Qrcode | null = null;
+    private html5QrCode: Html5QrcodeType | null = null;
     private startPromise: Promise<any> | null = null;
     constructor(app: App, private onScan: (text: string) => void) { super(app); }
-    
+
     onOpen() {
         const { contentEl } = this;
         contentEl.createEl('h2', { text: 'Scan QR Code' });
         const readerId = 'od-qr-reader';
         contentEl.createDiv({ attr: { id: readerId } });
-        
-        this.html5QrCode = new Html5Qrcode(readerId);
-        this.startPromise = this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
-            this.onScan(decodedText);
-            this.close();
-        }, () => {}).catch(err => {
+
+        // The scanner library is loaded on demand; onClose may run before it resolves,
+        // so startPromise gates cleanup on the whole load-and-start sequence.
+        this.startPromise = loadHtml5Qrcode().then(Html5Qrcode => {
+            this.html5QrCode = new Html5Qrcode(readerId);
+            return this.html5QrCode.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: 250, height: 250 } }, (decodedText) => {
+                this.onScan(decodedText);
+                this.close();
+            }, () => {});
+        }).catch(err => {
             contentEl.createEl('p', { text: 'Error starting camera: ' + err, cls: 'mod-warning' });
         });
     }
