@@ -1,48 +1,26 @@
 import { Platform } from 'obsidian';
 import { DirectIpConfig, SyncData } from './types';
+import { splitBinaryPayload, joinBinaryPayload, packFrame, unpackFrame } from './utils';
 import type ObsidianDecentralizedPlugin from './main';
 
 // Heartbeat constants (mirror main.ts startHeartbeat)
 const HEARTBEAT_INTERVAL_MS = 5000;   // ping every 5 s
 const LIVENESS_TIMEOUT_MS   = 20000;  // declare dead after 20 s of silence
 
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
-
-// Custom Framing Helpers
+/**
+ * Frame a message for the wire. Messages with a bulk binary body (file chunks,
+ * binary batches, binary file updates, encrypted frames) are sent as a single
+ * binary frame; everything else goes as JSON text.
+ *
+ * The per-type branches this used to carry are now one call to splitBinaryPayload,
+ * which is shared with the encryption layer in main.ts so both agree on which
+ * field holds the body.
+ */
 function encodeMessage(msg: SyncData | any): string | ArrayBuffer {
-    if (msg.type === 'file-chunk-data' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
-        const { data, ...header } = msg;
-        const headerStr = JSON.stringify(header);
-        const headerBytes = textEncoder.encode(headerStr);
-        const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
-        const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
-        new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(0, headerBytes.length, true);
-        buffer.set(headerBytes, 4);
-        buffer.set(binaryData, 4 + headerBytes.length);
-        return buffer.buffer;
-    } else if (msg.type === 'file-batch-binary' && (msg.data instanceof ArrayBuffer || msg.data instanceof Uint8Array)) {
-        const { data, ...header } = msg;
-        const headerStr = JSON.stringify(header);
-        const headerBytes = textEncoder.encode(headerStr);
-        const binaryData = msg.data instanceof Uint8Array ? msg.data : new Uint8Array(msg.data);
-        const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
-        new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(0, headerBytes.length, true);
-        buffer.set(headerBytes, 4);
-        buffer.set(binaryData, 4 + headerBytes.length);
-        return buffer.buffer;
-    } else if (msg.type === 'file-update' && msg.encoding === 'binary' && (msg.content instanceof ArrayBuffer || msg.content instanceof Uint8Array)) {
-        const { content, ...header } = msg;
-        const headerStr = JSON.stringify(header);
-        const headerBytes = textEncoder.encode(headerStr);
-        const binaryData = msg.content instanceof Uint8Array ? msg.content : new Uint8Array(msg.content);
-        const buffer = new Uint8Array(4 + headerBytes.length + binaryData.byteLength);
-        new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength).setUint32(0, headerBytes.length, true);
-        buffer.set(headerBytes, 4);
-        buffer.set(binaryData, 4 + headerBytes.length);
-        return buffer.buffer;
-    }
-    return JSON.stringify(msg);
+    const { header, body } = splitBinaryPayload(msg);
+    if (!body) return JSON.stringify(msg);
+    const framed = packFrame(header, body);
+    return framed.buffer.slice(framed.byteOffset, framed.byteOffset + framed.byteLength);
 }
 
 function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
@@ -58,25 +36,8 @@ function decodeMessage(data: string | ArrayBuffer | Uint8Array): any {
         throw new Error('Unsupported data type');
     }
 
-    if (buffer.byteLength < 4) {
-        throw new Error('Message too short');
-    }
-    const view = new DataView(buffer);
-    const headerLen = view.getUint32(0, true);
-    if (buffer.byteLength < 4 + headerLen) {
-        throw new Error(`Malformed message: header length (${headerLen}) exceeds buffer size (${buffer.byteLength})`);
-    }
-    const headerBytes = new Uint8Array(buffer, 4, headerLen);
-    const headerStr = textDecoder.decode(headerBytes);
-    const header = JSON.parse(headerStr);
-    const dataBuffer = buffer.slice(4 + headerLen);
-
-    if (header.type === 'file-chunk-data' || header.type === 'file-batch-binary') {
-        header.data = dataBuffer;
-    } else if (header.type === 'file-update') {
-        header.content = dataBuffer;
-    }
-    return header;
+    const { header, body } = unpackFrame(buffer);
+    return joinBinaryPayload(header, body);
 }
 
 // ─── DirectIpServer ────────────────────────────────────────────────────────────

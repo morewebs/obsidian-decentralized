@@ -88,6 +88,7 @@ import {
     packFilesToTLV,
     unpackTLVToFiles,
     PackedFile,
+    mapWithConcurrency,
     PROTOCOL_VERSION,
     splitBinaryPayload,
     joinBinaryPayload,
@@ -98,6 +99,22 @@ import {
 import { TimeoutManager } from './src/utils/Timeouts';
 import { QueueManager } from './src/core/QueueManager';
 import { ConnectionManager } from './src/core/ConnectionManager';
+
+/** Extensions treated as text (everything else is binary). */
+const TEXT_EXTENSIONS = new Set(['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']);
+
+/** Extensions still synced when 'syncAllFileTypes' is off. */
+const TEXT_WHITELIST = new Set(['md', 'css', 'js', 'json']);
+
+/** Subpaths of .obsidian/ that are safe to sync in 'auto' mode. */
+const AUTO_SAFE_CONFIG_PATHS = ['.obsidian/snippets/', '.obsidian/themes/', '.obsidian/appearance.json'];
+
+/**
+ * Single shared diff-match-patch instance. It holds no per-call state across the
+ * operations used here, and it was previously constructed fresh at four call sites,
+ * including the per-file delta path.
+ */
+const dmp = new DiffMatchPatch();
 
 export default class ObsidianDecentralizedPlugin extends Plugin {
     settings: ObsidianDecentralizedSettings;
@@ -146,13 +163,34 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private ignoreEvents: Map<string, number> = new Map();
     private statusBar: HTMLElement;
+    // Persistent status-bar elements plus the last rendered state, so updateStatus can
+    // diff instead of rebuilding the DOM on every call.
+    private statusContainerEl: HTMLElement | null = null;
+    private statusIconEl: HTMLElement | null = null;
+    private statusTextEl: HTMLElement | null = null;
+    private lastRenderedStatus: SyncStatusState | null = null;
     private conflictCenter: ConflictCenter;
     public activeTransfers: Map<string, TransferStatus> = new Map();
     public joinPin: string | null = null;
     public activePsk: string | null = null;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
-    private pendingFileChunks: Map<string, { path: string, mtime: number, chunks: ArrayBuffer[], total: number, receivedCount: number, lastUpdated: number, fileHash: string, compressed?: boolean, versionVector?: VersionVector }> = new Map();
+    private pendingFileChunks: Map<string, {
+        path: string,
+        mtime: number,
+        /** Preallocated destination; chunks are written to their final offsets on arrival. */
+        buffer: Uint8Array,
+        /** received[i] = 1 once chunk i has been written, so duplicates are not double-counted. */
+        received: Uint8Array,
+        totalBytes: number,
+        chunkSize: number,
+        total: number,
+        receivedCount: number,
+        lastUpdated: number,
+        fileHash: string,
+        compressed?: boolean,
+        versionVector?: VersionVector
+    }> = new Map();
     
     // Timeouts and Keep-alives
     private syncIdleTimeout: number | null = null;
@@ -165,7 +203,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private successfulTransfersSinceLastIncrease = 0;
     private peerInitRetryTimeout: number | null = null;
     private peerInitAttempts = 0;
-    private debouncedHandleFileChange: (file: TAbstractFile) => void;
+    /** path -> pending debounce timer handle for that path's change event. */
+    private pendingFileChanges: Map<string, number> = new Map();
     public directIpServer: DirectIpServer | null = null;
     public directIpClient: DirectIpClient | null = null;
     private lastHeard: Map<string, number> = new Map();
@@ -174,8 +213,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private networkChangeHandler: (() => void) | null = null;
     private peerReconnectFallbackTimeout: number | null = null;
     private statePath: string;
+    private hashCachePath: string;
     public manualPingStart: Map<string, number> = new Map();
     private debouncedSaveState: () => void;
+    private debouncedSaveHashCache: () => void;
+    private debouncedSaveQueue: () => void;
+    // Dirty flags: without them the debounced savers rewrote identical files on every
+    // tick, since most call sites fire whether or not anything actually changed.
+    private stateDirty: boolean = false;
+    private hashCacheDirty: boolean = false;
+    private queueDirty: boolean = false;
+    private lastStateSaveAt: number = 0;
     public failedSyncs: FailedSync[] = [];
     private syncedHashes: Map<string, { hash: string, timestamp: number }> = new Map();
 
@@ -189,10 +237,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     public twoDeviceState: TwoDeviceState = { fileVersions: {}, merkleTreeRoot: null };
     public tombstones: Record<string, number> = {};
     public currentSyncIsTwoDeviceMode: boolean | null = null;
+    /** 0 means the cached Merkle tree is stale and must be rebuilt. */
+    private merkleTreeBuiltAt: number = 0;
     private syncDrainCallback: (() => void) | null = null;
     
     // Pull-based Sync State
     private pullRetries: Map<string, number> = new Map();
+    // Smallest-first pull order for the active sync plan, consumed via a cursor.
+    private pullOrder: string[] = [];
+    private pullCursor: number = 0;
+    /** Folders confirmed to exist, so batch writes stop re-walking every path segment. */
+    private knownFolders: Set<string> = new Set();
     private peerFileSizes: Record<string, number> = {};
     private localSyncComplete: Map<string, boolean> = new Map();
     private peerSyncComplete: Map<string, boolean> = new Map();
@@ -230,7 +285,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
 
         this.statePath = `${this.manifest.dir}/state.json`;
-        this.debouncedSaveState = debounce(this.saveState.bind(this), 1000);
+        this.hashCachePath = `${this.manifest.dir}/hash-cache.json`;
+        this.debouncedSaveState = debounce(() => { void this.saveState(); }, 1000);
+        // The hash cache is rebuildable, so it tolerates a lazy cadence; it is also
+        // flushed on unload.
+        this.debouncedSaveHashCache = debounce(() => { void this.saveHashCache(); }, 30000);
+        this.debouncedSaveQueue = debounce(() => { void this.saveQueueState(); }, 2000);
         this.debouncedEditorChange = debounce(this.handleEditorChangeDebounced.bind(this), 200);
 
         await this.loadSettings();
@@ -245,11 +305,24 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
         });
 
-        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), this.settings.debounceDelay);
-        this.registerEvent(this.app.vault.on('create', (file) => this.handleEvent(file)));
-        this.registerEvent(this.app.vault.on('modify', (file) => this.handleEvent(file)));
-        this.registerEvent(this.app.vault.on('delete', (file) => this.handleEvent(file)));
-        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.handleRenameEvent(file, oldPath)));
+        // Any vault mutation — local or applied from a peer — makes the cached Merkle
+        // tree stale.
+        const onVaultEvent = (file: TAbstractFile) => {
+            this.invalidateMerkleTree();
+            this.handleEvent(file);
+        };
+        this.registerEvent(this.app.vault.on('create', onVaultEvent));
+        this.registerEvent(this.app.vault.on('modify', onVaultEvent));
+        this.registerEvent(this.app.vault.on('delete', (file) => {
+            // A removed path can no longer be assumed to exist.
+            this.forgetKnownFolders(file.path);
+            onVaultEvent(file);
+        }));
+        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+            this.invalidateMerkleTree();
+            this.forgetKnownFolders(oldPath);
+            this.handleRenameEvent(file, oldPath);
+        }));
         this.registerEvent(this.app.workspace.on('editor-change', (editor, info) => this.handleEditorChange(editor, info)));
 
         this.initializeConnectionManager();
@@ -289,7 +362,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.queueManager.clear();
         this.timeoutManager.clearAll();
 
-        this.saveState(); // Force immediate save on unload instead of debounced delay
+        // Force immediate saves on unload instead of waiting out the debounce windows.
+        void this.saveState(true);
+        void this.saveHashCache(true);
+        void this.saveQueueState(true);
     }
 
     // --- Core Two-Device Infrastructure ---
@@ -310,7 +386,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     incrementVersion(path: string) {
         if (!this.twoDeviceState.fileVersions[path]) this.twoDeviceState.fileVersions[path] = {};
         this.twoDeviceState.fileVersions[path][this.settings.deviceId] = (this.twoDeviceState.fileVersions[path][this.settings.deviceId] || 0) + 1;
-        this.debouncedSaveState();
+        this.scheduleStateSave();
     }
 
     mergeVersions(local: VersionVector, remote: VersionVector): VersionVector {
@@ -335,23 +411,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     // --- Merkle Tree Vault Diffing ---
+    /**
+     * Build the vault's Merkle tree.
+     *
+     * Files above MERKLE_SURROGATE_SIZE use a cheap size+mtime surrogate instead of a
+     * real content hash, to avoid reading hundreds of MB just to compare trees. That
+     * surrogate is deliberately NOT written into syncedHashes: doing so poisoned the
+     * real hash cache, so buildVaultManifest published a fake hash and the
+     * echo-suppression check in processQueueItem could never match. The visible symptom
+     * was every large file re-transferring on every reconnect.
+     */
     async buildMerkleTree(): Promise<MerkleNode> {
+        const MERKLE_SURROGATE_SIZE = 5 * 1024 * 1024;
         const tree: MerkleNode = { hash: '', children: {} };
         const allFiles = this.app.vault.getAllLoadedFiles();
-        
+        let lastYield = Date.now();
+
         for (const file of allFiles) {
             if (file instanceof TFile && this.isPathSyncable(file.path)) {
                 let hash = this.syncedHashes.get(file.path)?.hash;
                 if (!hash) {
-                    if (file.stat.size > 5 * 1024 * 1024) {
-                        hash = `massive-${file.stat.size}-${file.stat.mtime}`;
+                    if (file.stat.size > MERKLE_SURROGATE_SIZE) {
+                        // Tree-local surrogate only; never cached as a content hash.
+                        hash = `size-${file.stat.size}-mtime-${file.stat.mtime}`;
                     } else {
                         const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
                         hash = await this.getHash(content);
+                        this.updateHashCache(file.path, hash);
                     }
-                    this.updateHashCache(file.path, hash);
                 }
-                
+
+                // Hashing a whole vault can run for seconds; keep the UI responsive.
+                if (Date.now() - lastYield > 8) {
+                    await new Promise(r => setTimeout(r, 0));
+                    lastYield = Date.now();
+                }
+
                 const parts = file.path.split('/');
                 let current = tree;
                 for (let i = 0; i < parts.length; i++) {
@@ -393,81 +488,167 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         await computeHashes(tree);
         this.twoDeviceState.merkleTreeRoot = tree;
-        this.debouncedSaveState();
+        this.merkleTreeBuiltAt = Date.now();
+        this.scheduleStateSave();
         return tree;
     }
 
-    // --- State Management ---
-    async loadState() {
-        const bakPath = this.statePath + '.bak';
-        const tryLoad = async (path: string): Promise<any | null> => {
-            try {
-                if (await this.app.vault.adapter.exists(path)) {
-                    return JSON.parse(await this.app.vault.adapter.read(path));
-                }
-            } catch (e) {
-                console.error(`Failed to parse state from ${path}:`, e);
-            }
-            return null;
-        };
+    /**
+     * Merkle tree, rebuilt only when the vault may have changed since the last build.
+     *
+     * buildMerkleTree walks and hashes the entire vault. It ran unconditionally on every
+     * handshake and on every incoming merkle-root, so a flapping connection re-hashed
+     * the whole vault repeatedly. Vault mutations clear the cache via
+     * invalidateMerkleTree(), so a reconnect with no local edits is free.
+     */
+    private async getMerkleTree(): Promise<MerkleNode> {
+        const cached = this.twoDeviceState.merkleTreeRoot;
+        if (cached && this.merkleTreeBuiltAt > 0) return cached;
+        return this.buildMerkleTree();
+    }
 
-        let state = await tryLoad(this.statePath);
+    private invalidateMerkleTree() {
+        this.merkleTreeBuiltAt = 0;
+    }
+
+    // --- State Management ---
+    //
+    // Durable truth (version vectors, tombstones, failed syncs, resumable transfers)
+    // lives in state.json. The SHA-256 cache is a pure rebuildable cache and lives in
+    // hash-cache.json on a much slower cadence: it is by far the largest field, and
+    // folding it into every save meant re-serialising megabytes of JSON roughly once a
+    // second for the whole duration of a sync.
+
+    private async readJson(path: string): Promise<any | null> {
+        try {
+            if (await this.app.vault.adapter.exists(path)) {
+                return JSON.parse(await this.app.vault.adapter.read(path));
+            }
+        } catch (e) {
+            console.error(`Failed to parse state from ${path}:`, e);
+        }
+        return null;
+    }
+
+    /**
+     * Write via .tmp then rotate with renames. The previous implementation read the
+     * whole existing file back just to copy it to .bak, costing a full extra read and
+     * write of the largest file in the plugin on every single save.
+     */
+    private async writeJsonAtomic(path: string, json: string) {
+        const tmpPath = path + '.tmp';
+        const bakPath = path + '.bak';
+        const adapter = this.app.vault.adapter;
+        try {
+            await adapter.write(tmpPath, json);
+            if (await adapter.exists(path)) {
+                if (await adapter.exists(bakPath)) {
+                    try { await adapter.remove(bakPath); } catch (_) { /* best effort */ }
+                }
+                try {
+                    await adapter.rename(path, bakPath);
+                } catch (_) {
+                    // Some adapters/platforms refuse the rename; the .tmp copy below is
+                    // still a complete file, so fall through rather than abort the save.
+                }
+            }
+            try {
+                await adapter.rename(tmpPath, path);
+            } catch (_) {
+                // Rename unavailable — fall back to a direct write and clean up .tmp.
+                await adapter.write(path, json);
+                if (await adapter.exists(tmpPath)) await adapter.remove(tmpPath);
+            }
+        } catch (e) {
+            console.error(`Failed to save ${path}:`, e);
+        }
+    }
+
+    async loadState() {
+        let state = await this.readJson(this.statePath);
         if (!state) {
             console.warn('Primary state.json failed — attempting backup recovery...');
-            state = await tryLoad(bakPath);
+            state = await this.readJson(this.statePath + '.bak');
             if (state) this.showNotice('Recovered sync state from backup (state.json.bak).', 'warning');
         }
-        if (!state) return;
 
-        if (state.activeTransfers) {
-            for (const t of state.activeTransfers) {
-                this.activeTransfers.set(t.id, { ...t, status: 'paused' });
+        if (state) {
+            if (state.activeTransfers) {
+                for (const t of state.activeTransfers) {
+                    this.activeTransfers.set(t.id, { ...t, status: 'paused' });
+                }
+                this.updateStatus();
             }
-            this.updateStatus();
+            if (state.failedSyncs) this.failedSyncs = state.failedSyncs;
+            if (state.tombstones) this.tombstones = state.tombstones;
+            if (state.twoDeviceState) {
+                this.twoDeviceState = state.twoDeviceState;
+                if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
+            }
+            // Migration: 2.x kept the hash cache inside state.json.
+            if (state.syncedHashes) {
+                for (const [p, d] of Object.entries(state.syncedHashes)) {
+                    this.syncedHashes.set(p, d as any);
+                }
+                this.hashCacheDirty = true;
+            }
         }
-        if (state.failedSyncs) this.failedSyncs = state.failedSyncs;
-        if (state.tombstones) this.tombstones = state.tombstones;
-        if (state.twoDeviceState) {
-            this.twoDeviceState = state.twoDeviceState;
-            if (!this.twoDeviceState.fileVersions) this.twoDeviceState.fileVersions = {};
-        }
-        if (state.syncedHashes) {
-            for (const [p, d] of Object.entries(state.syncedHashes)) {
+
+        const cache = await this.readJson(this.hashCachePath);
+        if (cache && cache.syncedHashes) {
+            for (const [p, d] of Object.entries(cache.syncedHashes)) {
                 this.syncedHashes.set(p, d as any);
             }
         }
+
         await this.loadQueueState();
     }
 
-    async saveState() {
-        const state = {
+    /**
+     * @param force bypass the dirty check and the during-sync rate limit (used on unload).
+     */
+    async saveState(force = false) {
+        if (!force) {
+            if (!this.stateDirty) return;
+            // A sync mutates version vectors and transfer progress constantly; 1 s
+            // writes there are pure overhead when the data is only needed on restart.
+            const minInterval = this.syncState.isSyncing ? 5000 : 0;
+            if (minInterval && Date.now() - this.lastStateSaveAt < minInterval) {
+                this.scheduleStateSave();
+                return;
+            }
+        }
+        this.stateDirty = false;
+        this.lastStateSaveAt = Date.now();
+
+        const json = JSON.stringify({
             activeTransfers: Array.from(this.activeTransfers.values()),
             failedSyncs: this.failedSyncs,
             twoDeviceState: this.twoDeviceState,
             tombstones: this.tombstones,
-            syncedHashes: Object.fromEntries(this.syncedHashes)
-        };
-        const json = JSON.stringify(state, null, 2);
-        const tmpPath = this.statePath + '.tmp';
-        const bakPath = this.statePath + '.bak';
-        try {
-            // Stage into .tmp first so a mid-write crash doesn't corrupt the main file
-            await this.app.vault.adapter.write(tmpPath, json);
-            // Snapshot the last-known-good state before overwriting
-            if (await this.app.vault.adapter.exists(this.statePath)) {
-                const prev = await this.app.vault.adapter.read(this.statePath);
-                await this.app.vault.adapter.write(bakPath, prev);
-            }
-            await this.app.vault.adapter.write(this.statePath, json);
-            if (await this.app.vault.adapter.exists(tmpPath)) {
-                await this.app.vault.adapter.remove(tmpPath);
-            }
-        } catch (e) {
-            console.error('Failed to save state:', e);
-        }
-        await this.saveQueueState();
+        });
+        await this.writeJsonAtomic(this.statePath, json);
     }
-    
+
+    async saveHashCache(force = false) {
+        if (!force && !this.hashCacheDirty) return;
+        this.hashCacheDirty = false;
+        const json = JSON.stringify({ syncedHashes: Object.fromEntries(this.syncedHashes) });
+        await this.writeJsonAtomic(this.hashCachePath, json);
+    }
+
+    /** Mark durable state as needing a write and schedule the debounced save. */
+    private scheduleStateSave() {
+        this.stateDirty = true;
+        this.debouncedSaveState();
+    }
+
+    /** Queue contents changed. Persisted separately from state.json, on its own cadence. */
+    private scheduleQueueSave() {
+        this.queueDirty = true;
+        this.debouncedSaveQueue();
+    }
+
     updateHashCache(path: string, hash: string) {
         if (this.syncedHashes.has(path)) {
             this.syncedHashes.delete(path);
@@ -477,7 +658,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             const oldestPath = this.syncedHashes.keys().next().value;
             if (oldestPath) this.syncedHashes.delete(oldestPath);
         }
-        this.debouncedSaveState();
+        // Cache-only mutation: this used to trigger a full state write per hashed file.
+        this.hashCacheDirty = true;
+        this.debouncedSaveHashCache();
     }
 
     pruneTombstones() {
@@ -491,7 +674,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 pruned = true;
             }
         }
-        if (pruned) this.debouncedSaveState();
+        if (pruned) this.scheduleStateSave();
     }
 
     async loadSettings() { 
@@ -509,17 +692,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.settings.knownPeers.forEach(p => this.clusterPeers.set(p.deviceId, p));
         }
     }
-    async saveSettings() { 
+    async saveSettings() {
         await this.saveData(this.settings);
         // Invalidate folder filter caches so isPathSyncable picks up the new values immediately
         this._cachedExcludedFolders = null;
         this._cachedIncludedFolders = null;
+        // A PSK may have been added, rotated or removed — drop cached CryptoKeys so a
+        // stale key is never reused for a peer.
+        this.invalidateCryptoKey();
     }
     async saveKnownPeers() { this.settings.knownPeers = Array.from(this.clusterPeers.values()); await this.saveSettings(); }
 
-    public updateDebounceDelay() {
-        this.debouncedHandleFileChange = debounce(this.handleFileChange.bind(this), this.settings.debounceDelay);
-    }
+    /**
+     * Kept for the settings tab. Per-path debouncers read settings.debounceDelay when
+     * they are armed, so a changed delay applies to subsequent events with no rebuild.
+     */
+    public updateDebounceDelay() { /* no-op: delay is read per event */ }
 
     applyHideNativeSync() {
         if (this.settings.hideNativeSyncStatus) {
@@ -607,11 +795,33 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
 
-        if (!this.app.vault.getAbstractFileByPath(file.path)) { 
-            this.handleFileDelete(file); 
-            return; 
-        } 
-        this.debouncedHandleFileChange(file); 
+        if (!this.app.vault.getAbstractFileByPath(file.path)) {
+            this.handleFileDelete(file);
+            return;
+        }
+        this.debounceFileChange(file);
+    }
+
+    /**
+     * Per-path debounce for file changes.
+     *
+     * Obsidian's debounce() keeps a single timer and the last call's arguments win, so
+     * one shared debouncer meant that editing file A and then file B inside the window
+     * dropped A's sync entirely. Each path now gets its own timer.
+     */
+    private debounceFileChange(file: TAbstractFile) {
+        const path = file.path;
+        const existing = this.pendingFileChanges.get(path);
+        if (existing !== undefined) this.timeoutManager.clearTimeout(existing);
+
+        const handle = this.timeoutManager.setTimeout(() => {
+            this.pendingFileChanges.delete(path);
+            // Re-resolve the file: it may have been renamed or deleted while waiting.
+            const current = this.app.vault.getAbstractFileByPath(path);
+            if (current) void this.handleFileChange(current);
+        }, this.settings.debounceDelay);
+
+        this.pendingFileChanges.set(path, handle);
     }
     
     private async handleFileChange(file: TAbstractFile) { 
@@ -641,7 +851,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (file instanceof TFile) { 
                 if (this.isTwoDeviceMode()) this.incrementVersion(file.path); 
                 this.tombstones[file.path] = Date.now(); 
-                this.debouncedSaveState(); 
+                this.scheduleStateSave(); 
                 this.addToQueueTask(null, { taskType: 'send-delete', path: file.path }); 
             } else if (file instanceof TFolder) { 
                 this.broadcastData({ type: 'folder-delete', path: file.path, transferId: this.generateTransferId(file.path) }); 
@@ -666,13 +876,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 if (cached) {
                     this.syncedHashes.set(file.path, cached);
                     this.syncedHashes.delete(oldPath);
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 }
                 const vector = this.twoDeviceState.fileVersions[oldPath];
                 if (vector) {
                     this.twoDeviceState.fileVersions[file.path] = vector;
                     delete this.twoDeviceState.fileVersions[oldPath];
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 }
                 
                 if (file instanceof TFile) { 
@@ -715,7 +925,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const cached = this.lastSentContent.get(path);
         
         if (cached) {
-            const dmp = new DiffMatchPatch();
+            // uses the shared module-level dmp instance
             const patches = dmp.patch_make(cached.content, currentText);
             if (patches.length > 0) {
                 const patchText = dmp.patch_toText(patches);
@@ -813,7 +1023,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private computePriority(data: SyncData): number {
         if (data.type === 'editor-delta' || data.type === 'editor-active' || data.type.startsWith('lock-')) return 1000000; 
 
-        const controlMessages = ['request-full-sync', 'sync-plan', 'request-batch', 'batch-complete', 'full-sync-complete', 'sync-control-json'];
+        const controlMessages = ['request-full-sync', 'sync-plan', 'request-batch', 'batch-complete', 'full-sync-complete', 'sync-control-binary'];
         if (controlMessages.includes(data.type)) return 500000;
 
         if (data.type === 'folder-create' || data.type === 'folder-delete' || data.type === 'folder-rename') return 100000;
@@ -830,16 +1040,64 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return 50000;
     }
 
-    private addToQueue(peerId: string | null, data: SyncData) { 
+    /**
+     * Stable identity for a queued task, so that re-queueing the same work for the same
+     * peer coalesces instead of piling up. The QueueManager dedups on this id; it used
+     * to receive a random id per call, which meant its dedup set never matched anything
+     * and a file saved N times in quick succession was queued and sent N times.
+     *
+     * Only tasks get a stable id. 'data' items carry an already-built payload (often a
+     * distinct chunk or transfer) and must not be collapsed.
+     */
+    private taskQueueId(peerId: string | null, task: SyncTask): string {
+        const target = task.taskType === 'send-rename'
+            ? `${task.oldPath} ${task.newPath}`
+            : (task.taskType === 'send-file-batch' ? task.batchId : task.path);
+        return `${peerId || '*'} ${task.taskType} ${target}`;
+    }
+
+    /**
+     * Send one already-encoded payload to a peer, applying transport backpressure first.
+     *
+     * This replaces four near-identical inline blocks that each re-implemented the
+     * bufferedAmount wait (and, on the WebRTC side, each stomped on
+     * dc.onbufferedamountlow). Thresholds default to the small-message values; the
+     * chunk loop passes its own, larger ones.
+     */
+    private async sendPayloadTo(peerId: string, payload: any, highWater = 2 * 1024 * 1024, lowWater = 1 * 1024 * 1024) {
+        if (this.getConnectionMode() === 'direct-ip') {
+            if (this.directIpClient) {
+                await this.connectionManager.waitForSocketToDrain(
+                    () => this.directIpClient!.getBufferedAmount(), highWater, lowWater);
+                this.directIpClient.send(payload);
+            } else if (this.directIpServer) {
+                await this.connectionManager.waitForSocketToDrain(
+                    () => this.directIpServer!.getBufferedAmount(peerId), highWater, lowWater);
+                this.directIpServer.sendTo(peerId, payload);
+            } else {
+                throw new Error("No direct-IP transport available");
+            }
+            return;
+        }
+
+        const conn = this.connections.get(peerId);
+        if (!conn?.open) throw new Error("Connection closed");
+        const dc = (conn as any)?.dataChannel || (conn as any)?._dc;
+        await this.connectionManager.waitForBufferToDrain(dc, 60000, highWater, lowWater);
+        conn.send(payload);
+    }
+
+    private addToQueue(peerId: string | null, data: SyncData) {
         const priority = this.computePriority(data);
         this.queueManager.addToQueue({ peerId, data, retries: 0, priority });
-        this.debouncedSaveState();
+        // 'data' items are not persisted, so only the queue file is affected here.
+        this.scheduleQueueSave();
     }
-    
-    private addToQueueTask(peerId: string | null, task: SyncTask) { 
+
+    private addToQueueTask(peerId: string | null, task: SyncTask) {
         const priority = this.computePriorityTask(task);
-        this.queueManager.addToQueue({ peerId, task, retries: 0, priority });
-        this.debouncedSaveState();
+        this.queueManager.addToQueue({ id: this.taskQueueId(peerId, task), peerId, task, retries: 0, priority });
+        this.scheduleQueueSave();
     }
 
     public getQueuePressure(): number {
@@ -889,12 +1147,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         // Reuse messageId on retries so the peer's ACK for any attempt resolves the original promise
         const messageId = existingMessageId || this.generateTransferId(data.type);
-        // Wrap sync control messages as a JSON string inside a thin envelope.
-        // This prevents PeerJS's msgpack serializer from recursively packing
-        // large nested payloads (e.g. manifests with 20k+ items), which causes
-        // a "Maximum call stack size exceeded" RangeError.
-        const envelope = { type: 'sync-control-json', jsonPayload: JSON.stringify({ ...data, messageId }) };
-        
+        // Sync control messages are serialised to JSON and deflated into a binary body.
+        // Two reasons: PeerJS's msgpack serializer blows the stack recursively packing
+        // large nested payloads (a 20k-item manifest), and an uncompressed manifest is
+        // multiple MB of highly repetitive text that compresses by roughly an order of
+        // magnitude. The body rides as raw bytes, so nothing base64s it.
+        const envelope = {
+            type: 'sync-control-binary',
+            data: compressText(JSON.stringify({ ...data, messageId })),
+        };
+
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(async () => {
                 this.pendingSyncAcks.delete(messageId);
@@ -921,7 +1183,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.currentSyncIsTwoDeviceMode = null;
         this.syncDrainCallback = null;
         this.queueManager.clear();
-        this.debouncedSaveState();
+        this.scheduleQueueSave();
+        this.scheduleStateSave();
         this.activeTransfers.clear();
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
@@ -929,6 +1192,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
         this.pullRetries.clear();
+        this.pullOrder = [];
+        this.pullCursor = 0;
         this.syncState.peerId = null;
         this.peerFileSizes = {};
         if (this.syncIdleTimeout) { clearTimeout(this.syncIdleTimeout); this.syncIdleTimeout = null; }
@@ -1079,7 +1344,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 const cached = this.lastSentContent.get(file.path);
                                 const newText = content as string;
                                 if (cached) {
-                                    const dmp = new DiffMatchPatch();
+                                    // uses the shared module-level dmp instance
                                     const patches = dmp.patch_make(cached.content, newText);
                                     const patchText = dmp.patch_toText(patches);
                                     if (patchText.length < newText.length * (this.settings.deltaSyncThreshold / 100)) {
@@ -1199,7 +1464,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 reason: 'No peers connected',
                                 retryCount: 0
                             });
-                            this.debouncedSaveState();
+                            this.scheduleStateSave();
                         }
                     }
                     success = true;
@@ -1230,7 +1495,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         });
                     });
 
-                    await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!, 0, fileData.compressed, fileData.versionVector);
+                    // file-chunk-start.fileHash must describe the bytes actually on the
+                    // wire. fileData.fileHash is the hash of the ORIGINAL content, which
+                    // only matches the wire bytes when the body was not compressed.
+                    const wireHash = fileData.compressed ? undefined : fileData.fileHash;
+                    await this.sendFileInChunks(peerId, fileData.path, fileData.mtime, fileData.content as ArrayBuffer, transferId!, 0, fileData.compressed, fileData.versionVector, wireHash);
                     await ackPromise;
                     this.log(`Chunked transfer ${transferId} for ${fileData.path} completed successfully.`);
                     
@@ -1259,82 +1528,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         });
                     });
 
-                    if (isDirectIp) {
-                        if (this.directIpClient) this.directIpClient.send(finalPayload);
-                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
-                    } else {
-                        const conn = this.connections.get(peerId);
-                        if (conn?.open) {
-                            const dc = (conn as any)?.dataChannel || (conn as any)?._dc;
-                            if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
-                                await new Promise<void>(resolve => {
-                                    if (dc.bufferedAmount <= 1 * 1024 * 1024) return resolve();
-                                    const oldHandler = dc.onbufferedamountlow;
-                                    dc.bufferedAmountLowThreshold = 1 * 1024 * 1024;
-                                    dc.onbufferedamountlow = () => {
-                                        dc.onbufferedamountlow = oldHandler;
-                                        resolve();
-                                    };
-                                });
-                            }
-                            conn.send(finalPayload);
-                        }
-                        else throw new Error("Connection closed");
-                    }
+                    await this.sendPayloadTo(peerId, finalPayload);
                     await ackPromise;
-                    
+
                     if (data.type === 'file-update') {
                         (data as FileUpdatePayload).content = null as any;
                         item.data = null as any;
                     }
                 } else if (skipAck && peerId) {
                     // Batch transfer: fire-and-forget, batch-complete handles reliability
-                    if (isDirectIp) {
-                        if (this.directIpClient) this.directIpClient.send(finalPayload);
-                        else if (this.directIpServer) this.directIpServer.sendTo(peerId, finalPayload);
-                    } else {
-                        const conn = this.connections.get(peerId);
-                        if (conn?.open) {
-                            const dc = (conn as any)?.dataChannel || (conn as any)?._dc;
-                            if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
-                                await new Promise<void>(resolve => {
-                                    if (dc.bufferedAmount <= 1 * 1024 * 1024) return resolve();
-                                    const oldHandler = dc.onbufferedamountlow;
-                                    dc.bufferedAmountLowThreshold = 1 * 1024 * 1024;
-                                    dc.onbufferedamountlow = () => {
-                                        dc.onbufferedamountlow = oldHandler;
-                                        resolve();
-                                    };
-                                });
-                            }
-                            conn.send(finalPayload);
-                        } else throw new Error("Connection closed");
-                    }
-                    
+                    await this.sendPayloadTo(peerId, finalPayload);
+
                     if (data.type === 'file-update' || data.type === 'file-batch-binary') {
                         (data as any).content = null;
                         (data as any).data = null;
                         item.data = null as any;
                     }
-                } else
-                if (this.getConnectionMode() === 'direct-ip') {
+                } else if (peerId) {
+                    await this.sendPayloadTo(peerId, finalPayload);
+                } else if (isDirectIp) {
+                    // Untargeted broadcast over direct-IP.
                     if (this.directIpClient) this.directIpClient.send(finalPayload);
-                    else if (this.directIpServer) {
-                        // Route to the addressed peer only — broadcasting a targeted message
-                        // (e.g. a handshake response or lock grant) misdelivers it to every client
-                        if (peerId) this.directIpServer.sendTo(peerId, finalPayload);
-                        else this.directIpServer.send(finalPayload);
-                    }
+                    else if (this.directIpServer) this.directIpServer.send(finalPayload);
                 } else {
-                    const peersToSend = peerId ? [peerId] : Array.from(this.connections.keys());
-                    peersToSend.forEach(async pId => {
-                        let pPayload = data;
-                        if (this.settings.enableEncryption && this.settings.peerKeys[pId]) {
-                            pPayload = await this.encryptPayload(data, pId);
+                    // Untargeted broadcast over PeerJS: encrypt per peer with that peer's
+                    // key. This was a forEach with an async callback, so encryption
+                    // failures surfaced as unhandled rejections and the sends raced.
+                    for (const pId of Array.from(this.connections.keys())) {
+                        try {
+                            const pPayload = (this.settings.enableEncryption && this.settings.peerKeys[pId])
+                                ? await this.encryptPayload(data, pId)
+                                : data;
+                            await this.sendPayloadTo(pId, pPayload);
+                        } catch (e) {
+                            this.log(`Broadcast to ${pId} failed`, e);
                         }
-                        const conn = this.connections.get(pId);
-                        if (conn?.open) { conn.send(pPayload); }
-                    });
+                    }
                 }
             }
             success = true;
@@ -1401,7 +1630,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         existing.timestamp = Date.now();
                         existing.reason = e instanceof Error ? e.message : String(e);
                     }
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 }
                 // Dereference
                 if (item.data && item.data.type === 'file-update') item.data.content = null;
@@ -1441,7 +1670,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.pendingAcks.delete(transferId);
                 }
                 this.activeTransfers.delete(transferId);
-                this.debouncedSaveState();
+                this.scheduleStateSave();
             }
 
             if (isFinal && item.task && (item.task as any).batchId) {
@@ -1502,7 +1731,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
         }
-        if (changed) this.debouncedSaveState();
+        if (changed) this.scheduleStateSave();
     }
 
     public reinitializeConnectionManager() {
@@ -1565,6 +1794,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         this.peer.on('open', (id) => {
             clearTimeout(connectionTimeout);
+            // Cancel the reconnect fallback timer now that the peer is back online.
+            // This used to live in a second, separate 'open' listener.
+            if (this.peerReconnectFallbackTimeout !== null) {
+                clearTimeout(this.peerReconnectFallbackTimeout);
+                this.peerReconnectFallbackTimeout = null;
+            }
             this.peerInitAttempts = 0;
             this.log(`PeerJS connection open. ID: ${id}`);
             this.showNotice(`Decentralized Sync network is online.`, 'verbose', 3000);
@@ -1594,13 +1829,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         this.handlePeerError(new Error('Reconnect timed out'));
                     }
                 }, 15000);
-            }
-        });
-        this.peer.on('open', (id) => {
-            // Cancel the reconnect fallback timer if the peer comes back online
-            if (this.peerReconnectFallbackTimeout !== null) {
-                clearTimeout(this.peerReconnectFallbackTimeout);
-                this.peerReconnectFallbackTimeout = null;
             }
         });
         this.peer.on('close', () => { this.showNotice('Sync connection closed permanently.', 'important'); this.handlePeerError(new Error("Peer closed.")); });
@@ -1645,13 +1873,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingConnections.delete(conn.peer);
             this.log("DataConnection open with:", conn.peer);
             
-            const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin };
+            const payload = { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin, protocolVersion: PROTOCOL_VERSION };
             if (this.settings.peerKeys[conn.peer]) {
                 try {
-                    // encryptPayload already returns { type: 'encrypted', iv, data } —
-                    // wrapping it again produced a payload the receiver could never
-                    // decrypt (raw.iv/raw.data undefined), so every encrypted
-                    // reconnect handshake was silently dropped.
+                    // encryptPayload already returns the wire envelope
+                    // { type:'encrypted-frame', data } — wrapping it again produces a
+                    // payload the receiver can never decrypt.
                     const encrypted = await this.encryptPayload(payload, conn.peer);
                     conn.send(encrypted);
                 } catch(e) {
@@ -1677,6 +1904,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.connections.delete(peerId);
             this.lastHeard.delete(peerId);
             this.manualPingStart.delete(peerId);
+            this.lastSuccessfulMessageTime.delete(peerId);
             
             // Clear remote locks from this peer
             for (const [path, lock] of this.remoteLocks.entries()) {
@@ -1797,7 +2025,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     await ackPromise;
                     this.log(`Resumed transfer ${t.id} completed.`);
                     this.activeTransfers.delete(t.id);
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 } catch (e) {
                     if (e.message === 'Paused') this.log(`Transfer ${t.id} paused again.`);
                     else this.log(`Resumed transfer ${t.id} failed:`, e);
@@ -1809,7 +2037,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             } else {
                 this.activeTransfers.delete(t.id);
-                this.debouncedSaveState();
+                this.scheduleStateSave();
             }
         }
     }
@@ -1851,9 +2079,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async processIncomingData(data: any, conn: DataConnection | null) {
         if (!data || !data.type) return;
-        // Unwrap JSON-encoded sync control messages (see sendSyncMessage for why)
-        if (data.type === 'sync-control-json' && data.jsonPayload) {
-            try { data = JSON.parse(data.jsonPayload); } catch (e) { this.log('Failed to parse sync-control-json payload:', e); return; }
+        // Unwrap deflated sync control messages (see sendSyncMessage for why)
+        if (data.type === 'sync-control-binary' && data.data) {
+            try {
+                const raw = data.data;
+                const buf: ArrayBuffer = raw instanceof ArrayBuffer
+                    ? raw
+                    : (raw as Uint8Array).buffer.slice((raw as Uint8Array).byteOffset, (raw as Uint8Array).byteOffset + (raw as Uint8Array).byteLength);
+                data = JSON.parse(decompressText(buf));
+            } catch (e) { this.log('Failed to decode sync-control-binary payload:', e); return; }
         }
         this.log("Received data:", data.type, "from", conn?.peer);
         if (conn?.peer) {
@@ -2012,7 +2246,19 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleHandshake(data: HandshakePayload, conn: DataConnection) {
-        if (this.joinPin && data.pin !== this.joinPin) { 
+        // V3 changed the wire format incompatibly. Refuse mismatched peers up front —
+        // letting them through would mean silently dropped messages at best and a
+        // half-applied sync at worst.
+        if ((data.protocolVersion || 0) !== PROTOCOL_VERSION) {
+            this.showNotice(
+                `${data.peerInfo?.friendlyName || 'A peer'} is running an incompatible version of Obsidian Decentralized. Update both devices to v3.`,
+                'error', 12000
+            );
+            this.log(`Rejecting handshake from ${conn.peer}: protocol v${data.protocolVersion || 'unknown'} (expected v${PROTOCOL_VERSION})`);
+            conn.close();
+            return;
+        }
+        if (this.joinPin && data.pin !== this.joinPin) {
             this.showNotice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 'error', 10000); 
             conn.close(); 
             return; 
@@ -2028,7 +2274,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         
         if (this.getConnectionMode() === 'direct-ip') {
             if (!data.isResponse) {
-                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: data.pin, isResponse: true } as any);
+                this.sendData(conn.peer, { type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: data.pin, isResponse: true, protocolVersion: PROTOCOL_VERSION } as any);
             }
         } else {
             this.sendData(conn.peer, { type: 'cluster-gossip', peers: existingPeers });
@@ -2043,7 +2289,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             // paired vaults converge automatically after a reconnect. Without this trigger
             // the whole Merkle diffing path was dead code — nothing ever sent 'merkle-root'.
             if (this.settings.enableTwoDeviceOptimizations && this.currentRole === 'primary' && !this.syncState.isSyncing) {
-                this.buildMerkleTree()
+                this.getMerkleTree()
                     .then(tree => this.sendData(conn.peer, { type: 'merkle-root', rootHash: tree.hash }))
                     .catch(e => this.log('Failed to build Merkle tree for auto-reconciliation', e));
             }
@@ -2192,7 +2438,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const data = typeof buffer === 'string' ? ObsidianDecentralizedPlugin.textEncoder.encode(buffer) : buffer;
         const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
         const hashArray = new Uint8Array(hashBuffer);
-        return Array.from(hashArray).map(b => ObsidianDecentralizedPlugin.hexTable[b]).join('');
+        // Direct concat over the byte array. The previous Array.from(...).map(...).join('')
+        // allocated two intermediate arrays per hash, and this runs once per file per sync.
+        const hex = ObsidianDecentralizedPlugin.hexTable;
+        let out = '';
+        for (let i = 0; i < hashArray.length; i++) out += hex[hashArray[i]];
+        return out;
     }
 
     // --- Locking Handlers ---
@@ -2281,7 +2532,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.ignoreNextEventForPath(data.path);
                 
                 const currentText = view.editor.getValue();
-                const dmp = new DiffMatchPatch();
+                // uses the shared module-level dmp instance
                 const patches = dmp.patch_fromText(data.patches);
                 const [newText, results] = dmp.patch_apply(patches, currentText);
                 
@@ -2324,30 +2575,25 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async loadQueueState() {
-        const queuePath = `${this.manifest.dir}/queue.json`;
-        try {
-            if (await this.app.vault.adapter.exists(queuePath)) {
-                const data = await this.app.vault.adapter.read(queuePath);
-                const items = JSON.parse(data);
-                if (this.queueManager && Array.isArray(items)) {
-                    this.queueManager.loadQueue(items);
-                }
-            }
-        } catch (e) {
-            console.error('Failed to load queue state:', e);
+        const items = await this.readJson(`${this.manifest.dir}/queue.json`);
+        if (this.queueManager && Array.isArray(items)) {
+            // Defensively drop anything without a task: an older build persisted 'data'
+            // items whose ArrayBuffer bodies serialised to {}.
+            this.queueManager.loadQueue(items.filter((i: any) => i && i.task && !i.data));
         }
     }
 
-    async saveQueueState() {
+    async saveQueueState(force = false) {
         if (!this.queueManager) return;
-        const queuePath = `${this.manifest.dir}/queue.json`;
-        const tmpPath = queuePath + '.tmp';
+        if (!force && !this.queueDirty) return;
+        this.queueDirty = false;
         try {
-            const queueState = this.queueManager.getQueue();
-            const json = JSON.stringify(queueState);
-            await this.app.vault.adapter.write(tmpPath, json);
-            await this.app.vault.adapter.write(queuePath, json);
-            await this.app.vault.adapter.remove(tmpPath);
+            // Only 'task' items are persistable: they name a vault path and are re-derived
+            // from the vault on replay. 'data' items can hold an ArrayBuffer, which
+            // JSON.stringify turns into {} — reloading those produced silently corrupt
+            // queue entries that could never be sent.
+            const persistable = this.queueManager.getQueue().filter(item => !!item.task && !item.data);
+            await this.writeJsonAtomic(`${this.manifest.dir}/queue.json`, JSON.stringify(persistable));
         } catch (e) {
             console.error('Failed to save queue state:', e);
         }
@@ -2357,13 +2603,18 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         if (!this.isPathSyncable(file.path)) return;
         const isBinaryFile = this.isBinary(file.extension);
         if (isBinaryFile && !this.shouldSyncAllFileTypes()) { this.log(`Skipping binary file because 'syncAllFileTypes' is disabled: ${file.path}`); return; }
-        if (!isBinaryFile && !this.shouldSyncAllFileTypes()) { const textWhitelist = ['md', 'css', 'js', 'json']; if (!textWhitelist.includes(file.extension)) { this.log(`Skipping non-whitelisted text file: ${file.path}`); return; } }
+        if (!isBinaryFile && !this.shouldSyncAllFileTypes()) { if (!TEXT_WHITELIST.has(file.extension)) { this.log(`Skipping non-whitelisted text file: ${file.path}`); return; } }
         this.log(`Queueing file update for ${peerId || 'broadcast'}: ${file.path}`);
         
         this.addToQueueTask(peerId || null, { taskType: 'send-file', path: file.path, mtime: file.stat.mtime, forceFull });
     }
 
-    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, startIndex = 0, compressed?: boolean, versionVector?: VersionVector) {
+    /**
+     * @param knownHash SHA-256 of fileContent if the caller already computed it.
+     *   processQueueItem always has it, and re-digesting a multi-hundred-MB buffer
+     *   here was a full redundant pass over the file.
+     */
+    async sendFileInChunks(peerId: string, path: string, mtime: number, fileContent: ArrayBuffer, transferId: string, startIndex = 0, compressed?: boolean, versionVector?: VersionVector, knownHash?: string) {
         const isDirectIp = this.getConnectionMode() === 'direct-ip';
         let conn: DataConnection | undefined;
 
@@ -2376,8 +2627,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
         
-        const chunkSize = this.getChunkSize();
         const existingTransfer = this.activeTransfers.get(transferId);
+        // A resumed transfer MUST keep its original chunk size. getChunkSize() adapts to
+        // measured bandwidth, so recomputing it here made the sender re-chunk a partially
+        // sent file at a different boundary than both the receiver's offsets and the
+        // transfer's own recorded totalChunks.
+        const chunkSize = existingTransfer?.chunkSize || this.getChunkSize();
         this.activeTransfers.set(transferId, existingTransfer || {
             id: transferId,
             path,
@@ -2392,31 +2647,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             compressed: compressed
         });
         this.updateStatus();
-        this.debouncedSaveState();
+        this.scheduleStateSave();
 
         const totalChunks = Math.ceil(fileContent.byteLength / chunkSize);
         this.log(`Sending file in ${totalChunks} chunks to ${peerId}: ${path} (ID: ${transferId})`);
         
-        let chunkHash = '';
-        try { chunkHash = await this.getHash(fileContent); } catch(e) {}
+        let chunkHash = knownHash || '';
+        if (!chunkHash) {
+            try { chunkHash = await this.getHash(fileContent); } catch(e) {}
+        }
 
         const YIELD_THRESHOLD_MS = 100;
         let lastYieldTime = Date.now();
         const transferStartTime = Date.now();
         
+        const encryptFor = this.settings.enableEncryption && !!this.settings.peerKeys[peerId];
+
         if (startIndex === 0) {
-            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector };
-            if (isDirectIp) {
-                let encPayload: any = startPayload;
-                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, peerId);
-                if (this.directIpClient) this.directIpClient.send(encPayload);
-                else if (this.directIpServer) this.directIpServer.sendTo(peerId, encPayload);
-            }
-            else {
-                let encPayload: any = startPayload;
-                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(startPayload, peerId);
-                conn!.send(encPayload);
-            }
+            const startPayload: FileChunkStartPayload = { type: 'file-chunk-start', path, mtime, totalChunks, transferId, fileHash: chunkHash, compressed, versionVector, totalBytes: fileContent.byteLength, chunkSize };
+            const encPayload = encryptFor ? await this.encryptPayload(startPayload, peerId) : startPayload;
+            await this.sendPayloadTo(peerId, encPayload);
             this.resetIdleTimeout();
         }
         
@@ -2432,7 +2682,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const t = this.activeTransfers.get(transferId);
                     if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
                     this.updateStatus();
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                     throw new Error("Paused");
                 }
             } else if (!conn!.open) {
@@ -2440,48 +2690,31 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const t = this.activeTransfers.get(transferId);
                 if (t) { t.status = 'paused'; t.lastUpdate = Date.now(); }
                 this.updateStatus();
-                this.debouncedSaveState();
+                this.scheduleStateSave();
                 throw new Error("Paused");
             }
             try {
-                const start = i * chunkSize; const end = start + chunkSize; const chunk = fileContent.slice(start, end);
-                const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk };
-                
-                let encPayload: any = chunkPayload;
-                if (this.settings.enableEncryption && this.settings.peerKeys[peerId]) encPayload = await this.encryptPayload(chunkPayload, peerId);
+                const start = i * chunkSize;
+                const end = Math.min(start + chunkSize, fileContent.byteLength);
+                // When encrypting, a view suffices: the encrypt step copies into the
+                // ciphertext anyway, so slicing here was a wasted copy of every chunk.
+                // The plaintext path still needs a detached buffer, because the transport
+                // serialises it asynchronously and must not observe a moving window.
+                const chunk: ArrayBuffer | Uint8Array = encryptFor
+                    ? new Uint8Array(fileContent, start, end - start)
+                    : fileContent.slice(start, end);
+                const chunkPayload: FileChunkDataPayload = { type: 'file-chunk-data', transferId, index: i, data: chunk as ArrayBuffer };
+
+                const encPayload: any = encryptFor ? await this.encryptPayload(chunkPayload, peerId) : chunkPayload;
 
                 this.syncState.bytesTransferred += chunk.byteLength;
 
+                // Larger high/low water marks than small messages: the chunk loop wants
+                // to keep the pipe full rather than round-trip per chunk.
                 if (isDirectIp) {
-                    if (this.directIpClient) this.directIpClient.send(encPayload);
-                    else if (this.directIpServer) this.directIpServer.sendTo(peerId, encPayload);
-
-                    const getBuffer = () => this.directIpClient ? this.directIpClient.getBufferedAmount() : this.directIpServer!.getBufferedAmount(peerId);
-                    if (getBuffer() > 1024 * 1024 * 32) {
-                        await new Promise<void>(resolve => {
-                            const check = () => {
-                                if (getBuffer() <= 1024 * 1024 * 16) resolve();
-                                else if (typeof setImmediate !== 'undefined') setImmediate(check);
-                                else setTimeout(check, 1);
-                            };
-                            check();
-                        });
-                    }
-                }
-                else {
-                    conn!.send(encPayload);
-                    const dc = (conn! as any).dataChannel || (conn! as any)._dc;
-                    if (dc && dc.bufferedAmount > 1024 * 1024 * 16) {
-                        await new Promise<void>(resolve => {
-                            if (dc.bufferedAmount <= 1024 * 1024 * 8) return resolve();
-                            const oldHandler = dc.onbufferedamountlow;
-                            dc.bufferedAmountLowThreshold = 1024 * 1024 * 8;
-                            dc.onbufferedamountlow = () => {
-                                dc.onbufferedamountlow = oldHandler;
-                                resolve();
-                            };
-                        });
-                    }
+                    await this.sendPayloadTo(peerId, encPayload, 32 * 1024 * 1024, 16 * 1024 * 1024);
+                } else {
+                    await this.sendPayloadTo(peerId, encPayload, 16 * 1024 * 1024, 8 * 1024 * 1024);
                 }
 
                 const transfer = this.activeTransfers.get(transferId);
@@ -2497,7 +2730,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     lastYieldTime = Date.now();
                 }
                 
-                if (i % 100 === 0) this.debouncedSaveState();
+                // No per-chunk state save: resumable progress is reconstructed from
+                // activeTransfers, which is written whenever a transfer starts, pauses
+                // or finishes. Saving inside the send loop rewrote state.json hundreds
+                // of times per large file for no recovery benefit.
                 this.resetIdleTimeout();
             } catch (e) {
                 this.log(`Error sending chunk ${i} for ${path}. Aborting.`, e);
@@ -2515,7 +2751,32 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Rejecting chunked transfer for ${payload.path}: totalChunks (${payload.totalChunks}) would exceed max reassembly size.`);
             return;
         }
-        this.pendingFileChunks.set(payload.transferId, { path: payload.path, mtime: payload.mtime, chunks: new Array(payload.totalChunks), total: payload.totalChunks, receivedCount: 0, lastUpdated: Date.now(), fileHash: payload.fileHash || '', compressed: payload.compressed, versionVector: payload.versionVector }); 
+        const totalBytes = payload.totalBytes;
+        const chunkSize = payload.chunkSize;
+        if (!Number.isFinite(totalBytes) || totalBytes < 0 || totalBytes > MAX_REASSEMBLY_SIZE) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: invalid totalBytes (${totalBytes}).`);
+            return;
+        }
+        if (!Number.isFinite(chunkSize) || chunkSize <= 0 || chunkSize > MAX_CHUNK_SIZE) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: invalid chunkSize (${chunkSize}).`);
+            return;
+        }
+
+        this.pendingFileChunks.set(payload.transferId, {
+            path: payload.path,
+            mtime: payload.mtime,
+            // One preallocated buffer; chunks are written straight to their offsets.
+            buffer: new Uint8Array(totalBytes),
+            received: new Uint8Array(payload.totalChunks),
+            totalBytes,
+            chunkSize,
+            total: payload.totalChunks,
+            receivedCount: 0,
+            lastUpdated: Date.now(),
+            fileHash: payload.fileHash || '',
+            compressed: payload.compressed,
+            versionVector: payload.versionVector,
+        });
         this.activeTransfers.set(payload.transferId, {
             id: payload.transferId,
             path: payload.path,
@@ -2544,8 +2805,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.log(`Received invalid chunk index ${payload.index} for transfer ${payload.transferId}`);
             return;
         }
-        if (!transfer.chunks[payload.index]) {
-            transfer.chunks[payload.index] = payload.data;
+        const offset = payload.index * transfer.chunkSize;
+        if (offset + payload.data.byteLength > transfer.totalBytes) {
+            this.log(`Chunk ${payload.index} for ${transfer.path} overruns the declared size. Aborting transfer.`);
+            this.pendingFileChunks.delete(payload.transferId);
+            this.activeTransfers.delete(payload.transferId);
+            return;
+        }
+        if (!transfer.received[payload.index]) {
+            transfer.received[payload.index] = 1;
+            transfer.buffer.set(new Uint8Array(payload.data), offset);
             transfer.receivedCount++;
             this.syncState.bytesTransferred += payload.data.byteLength;
         }
@@ -2559,18 +2828,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.pendingFileChunks.delete(payload.transferId);
             this.activeTransfers.delete(payload.transferId);
             
-            const totalSize = transfer.chunks.reduce((sum, chunk) => sum + (chunk ? chunk.byteLength : 0), 0); 
-            const reassembled = new Uint8Array(totalSize); 
-            let offset = 0;
-            for (let i = 0; i < transfer.chunks.length; i++) { 
-                const chunk = transfer.chunks[i];
-                if (chunk) { 
-                    reassembled.set(new Uint8Array(chunk), offset); 
-                    offset += chunk.byteLength; 
-                }
-                transfer.chunks[i] = null as any; 
-            }
-            
+            // Already contiguous: chunks were written to their final offsets on arrival.
+            const reassembled = transfer.buffer;
+
             try {
                 const computedHash = await this.getHash(reassembled.buffer);
                 if (transfer.fileHash && computedHash && transfer.fileHash !== computedHash) {
@@ -2631,6 +2891,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         }
 
+        // Sweep expired ignore markers. shouldIgnoreEvent only deletes an entry when the
+        // path is read again, so paths that never receive another event — and every
+        // 'conflict:<path>' cooldown key, which is never read through that helper — leaked
+        // for the lifetime of the session.
+        for (const [p, ignoreUntil] of this.ignoreEvents.entries()) {
+            if (now >= ignoreUntil) this.ignoreEvents.delete(p);
+        }
+
         if (statusChanged) this.updateStatus();
     }
 
@@ -2660,7 +2928,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 throw new Error("IntegrityError: Base hash mismatch for delta sync");
             }
             
-            const dmp = new DiffMatchPatch();
+            // uses the shared module-level dmp instance
             const patches = dmp.patch_fromText(data.patches);
             const [newContent, results] = dmp.patch_apply(patches, localContent);
             
@@ -2674,7 +2942,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             if (this.isTwoDeviceMode() && data.versionVector) {
                 this.twoDeviceState.fileVersions[data.path] = data.versionVector;
-                this.debouncedSaveState();
+                this.scheduleStateSave();
             }
             
             const newHash = await this.getHash(newContent);
@@ -2709,7 +2977,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.handleNewFileCreation(data);
                 if (this.isTwoDeviceMode() && data.versionVector) {
                     this.twoDeviceState.fileVersions[data.path] = data.versionVector;
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 }
             } else if (existingFile instanceof TFile) {
                 await this.handleFileModification(data, existingFile);
@@ -2745,16 +3013,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
+    /**
+     * Create every missing folder along `path`.
+     *
+     * Confirmed folders are memoized: a batch of 500 files in one directory otherwise
+     * re-resolved every path segment 500 times. The cache only ever records folders we
+     * know exist, so a stale entry cannot cause a missing-folder write to be skipped —
+     * and it is dropped whenever a folder is deleted or renamed.
+     */
     private async ensureFolderExists(path: string) {
+        if (!path || this.knownFolders.has(path)) return;
+
         const folders = path.split('/');
         let currentPath = '';
         for (const folder of folders) {
             currentPath = currentPath === '' ? folder : `${currentPath}/${folder}`;
+            if (this.knownFolders.has(currentPath)) continue;
             if (!this.app.vault.getAbstractFileByPath(currentPath)) {
                 try {
                     await this.app.vault.createFolder(currentPath);
                 } catch (e) { /* Ignore if created concurrently */ }
             }
+            this.knownFolders.add(currentPath);
+        }
+    }
+
+    /** Forget memoized folders under `path` (inclusive) after a delete or rename. */
+    private forgetKnownFolders(path: string) {
+        this.knownFolders.delete(path);
+        const prefix = path + '/';
+        for (const known of this.knownFolders) {
+            if (known.startsWith(prefix)) this.knownFolders.delete(known);
         }
     }
 
@@ -2772,7 +3061,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log(`Ignoring update (content is identical): ${data.path}`);
                 if (this.isTwoDeviceMode() && data.versionVector) {
                     this.twoDeviceState.fileVersions[data.path] = this.mergeVersions(this.twoDeviceState.fileVersions[data.path] || {}, data.versionVector);
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 }
                 return;
             }
@@ -2792,7 +3081,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         await this.app.vault.modify(existingFile, data.content as string, { mtime: data.mtime });
                     }
                     this.twoDeviceState.fileVersions[data.path] = remoteVV;
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                     return;
                 } else if (isLocalNewer && !isRemoteNewer) {
                     this.log(`Ignoring update (local vector dominates): ${data.path}`);
@@ -2844,7 +3133,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const merged = this.mergeVersions(localVV, data.versionVector || {});
                     merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
                     this.twoDeviceState.fileVersions[data.path] = merged;
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                     
                     // Debounce re-send to prevent tight conflict resolution loops:
                     // if we just resolved this path, skip the immediate re-send.
@@ -2912,24 +3201,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             throw e;
         }
 
-        const writePromises = unpacked.map(async (fileData) => {
+        // Bounded concurrency: filesPerBatch grows to 500, and mapping all of them into
+        // Promise.allSettled meant up to 500 simultaneous vault writes, which starves the
+        // renderer and can exhaust file handles.
+        const BATCH_WRITE_CONCURRENCY = 8;
+        const settled = await mapWithConcurrency(unpacked, BATCH_WRITE_CONCURRENCY, async (fileData) => {
             try {
                 let contentStr = '';
                 let contentBuf: ArrayBuffer | null = null;
-                
+
                 if (fileData.encoding === 'binary') {
                     if (fileData.isCompressed) {
                         contentStr = decompressText(fileData.content);
                     } else {
-                        contentBuf = fileData.content instanceof Uint8Array ? 
-                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
+                        contentBuf = fileData.content instanceof Uint8Array ?
+                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) :
                             fileData.content;
                     }
                 } else if (fileData.encoding === 'base64') {
                     // For Base64 encoded ArrayBuffers (fallback/DirectIP)
-                    contentBuf = typeof fileData.content === 'string' ? base64ToArrayBuffer(fileData.content) : 
-                        (fileData.content instanceof Uint8Array ? 
-                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) : 
+                    contentBuf = typeof fileData.content === 'string' ? base64ToArrayBuffer(fileData.content) :
+                        (fileData.content instanceof Uint8Array ?
+                            fileData.content.buffer.slice(fileData.content.byteOffset, fileData.content.byteOffset + fileData.content.byteLength) :
                             fileData.content);
                 } else {
                     contentStr = ObsidianDecentralizedPlugin.textDecoder.decode(fileData.content);
@@ -2945,18 +3238,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             await this.app.vault.modify(existingFile, contentStr);
                         }
                     } else {
-                        // Create parent folders if missing
-                        const pathParts = fileData.path.split('/');
-                        let currentPath = '';
-                        for (let i = 0; i < pathParts.length - 1; i++) {
-                            currentPath += (i > 0 ? '/' : '') + pathParts[i];
-                            const folder = this.app.vault.getAbstractFileByPath(currentPath);
-                            if (!folder) {
-                                try {
-                                    await this.app.vault.createFolder(currentPath);
-                                } catch (e) { /* Ignore if created concurrently */ }
-                            }
-                        }
+                        const slash = fileData.path.lastIndexOf('/');
+                        if (slash > 0) await this.ensureFolderExists(fileData.path.substring(0, slash));
                         this.ignoreNextEventForPath(fileData.path);
                         if (contentBuf) {
                             await this.app.vault.createBinary(fileData.path, contentBuf);
@@ -2967,7 +3250,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.syncState.filesTransferred++;
                     this.syncState.bytesTransferred += fileData.content.byteLength;
                 });
-                
+
                 return fileData.path;
             } catch (e) {
                 this.log(`Failed to write batched file ${fileData.path}`, e);
@@ -2975,7 +3258,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             }
         });
 
-        const settled = await Promise.allSettled(writePromises);
         for (const result of settled) {
             if (result.status === 'fulfilled') {
                 results.succeeded.push(result.value);
@@ -3015,7 +3297,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const merged = this.mergeVersions(localVV, remoteVV);
                     merged[this.settings.deviceId] = (merged[this.settings.deviceId] || 0) + 1;
                     this.twoDeviceState.fileVersions[data.path] = merged;
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
 
                     const file = this.app.vault.getAbstractFileByPath(data.path);
                     if (file instanceof TFile && this.twoDevicePeerId) {
@@ -3025,12 +3307,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 } else {
                     // Remote delete dominates. Update version vector to reflect the deletion.
                     this.twoDeviceState.fileVersions[data.path] = remoteVV;
-                    this.debouncedSaveState();
+                    this.scheduleStateSave();
                 }
             }
 
             this.tombstones[data.path] = Date.now();
-            this.debouncedSaveState();
+            this.scheduleStateSave();
             this.syncedHashes.delete(data.path);
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (existingFile) {
@@ -3065,7 +3347,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
                             delete this.twoDeviceState.fileVersions[data.oldPath];
                         }
-                        this.debouncedSaveState(); 
+                        this.scheduleStateSave(); 
                         await this.app.vault.rename(fileToRename, data.newPath); 
                     } catch (e) { 
                         console.error(`Error renaming file: ${data.oldPath} -> ${data.newPath}`, e); 
@@ -3076,7 +3358,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     if (newFile instanceof TFile && data.versionVector) {
                         this.twoDeviceState.fileVersions[data.newPath] = data.versionVector;
                         delete this.twoDeviceState.fileVersions[data.oldPath];
-                        this.debouncedSaveState();
+                        this.scheduleStateSave();
                     }
                 }
             });
@@ -3178,7 +3460,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         // signal, so claiming isSyncing here left the plugin stuck in "Requesting Sync..."
         // until the phase timeout aborted with an error.
         if (this.syncState.isSyncing) return;
-        const tree = await this.buildMerkleTree();
+        const tree = await this.getMerkleTree();
         if (tree.hash === data.rootHash) {
             this.log("Merkle roots match — vaults already in sync.");
         } else {
@@ -3306,7 +3588,35 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             let peerPotentiallyStale = false;
             const retentionMs = (this.settings.tombstoneRetentionDays || 30) * 24 * 60 * 60 * 1000;
             const now = Date.now();
-            
+
+            // Pre-resolve the hashes the diff below needs but does not have cached.
+            // Doing this inside the loop meant a serial read+digest per ambiguous file,
+            // all of it counting against the 120 s PLANNING_TIMEOUT.
+            const needsHash: string[] = [];
+            for (const path of allPaths) {
+                const localItem = localIndex.get(path);
+                const remoteItem = remoteIndex.get(path);
+                if (!localItem || !remoteItem) continue;
+                if (localItem.type !== 'file' || remoteItem.type !== 'file') continue;
+                if (localItem.hash) continue;
+                if (localItem.size !== remoteItem.size) continue;
+                if (Math.abs(localItem.mtime - remoteItem.mtime) <= this.settings.mtimeTolerance) continue;
+                needsHash.push(path);
+            }
+
+            if (needsHash.length > 0) {
+                this.log(`Planning: hashing ${needsHash.length} ambiguous file(s) before diffing.`);
+                await mapWithConcurrency(needsHash, 8, async (path) => {
+                    const file = this.app.vault.getAbstractFileByPath(path);
+                    if (!(file instanceof TFile)) return;
+                    const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.cachedRead(file);
+                    const hash = await this.getHash(content);
+                    this.updateHashCache(path, hash);
+                    const item = localIndex.get(path);
+                    if (item && item.type === 'file') item.hash = hash;
+                });
+            }
+
             for (const path of allPaths) {
                 const localItem = localIndex.get(path);
                 const remoteItem = remoteIndex.get(path);
@@ -3360,15 +3670,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 if (localItem.mtime > remoteItem.mtime) { filesReceiverWillSend.push(path); fileSizes[path] = localItem.size; }
                                 else { filesInitiatorMustSend.push(path); this.peerFileSizes[path] = remoteItem.size; }
                             } else if (Math.abs(localItem.mtime - remoteItem.mtime) > this.settings.mtimeTolerance) {
-                                let lHash = localItem.hash;
-                                if (!lHash) {
-                                    const file = this.app.vault.getAbstractFileByPath(path);
-                                    if (file instanceof TFile) {
-                                        const content = this.isBinary(file.extension) ? await this.app.vault.readBinary(file) : await this.app.vault.read(file);
-                                        lHash = await this.getHash(content);
-                                        this.updateHashCache(path, lHash);
-                                    }
-                                }
+                                // Resolved by the concurrent pre-pass above; may still be
+                                // undefined if the file vanished in the meantime.
+                                const lHash = localItem.hash ?? this.syncedHashes.get(path)?.hash;
                                 if (remoteItem.hash && lHash === remoteItem.hash) {
                                     // Match
                                 } else {
@@ -3414,7 +3718,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 this.incrementVersion(path);
                             }
                             this.tombstones[path] = Date.now();
-                            this.debouncedSaveState();
+                            this.scheduleStateSave();
                         } catch (e) {
                             this.log(`Failed to delete file ${path}:`, e);
                         }
@@ -3424,6 +3728,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             this.syncState.allowedPulls = new Set(filesReceiverWillSend);
             this.syncState.pendingPulls = new Set(filesInitiatorMustSend);
+            this.initPullOrder(this.syncState.pendingPulls);
             this.requestNextBatch(conn.peer);
             
         } catch (e) {
@@ -3458,7 +3763,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                                 this.incrementVersion(path);
                             }
                             this.tombstones[path] = Date.now();
-                            this.debouncedSaveState();
+                            this.scheduleStateSave();
                         } catch (e) {
                             this.log(`Failed to delete file ${path}:`, e);
                         }
@@ -3474,7 +3779,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             this.syncState.allowedPulls = new Set(data.filesInitiatorMustSend);
             this.syncState.pendingPulls = new Set(data.filesReceiverWillSend);
-            
+            this.initPullOrder(this.syncState.pendingPulls);
+
             this.requestNextBatch(conn.peer);
         } catch (e) {
             this.log('Error processing sync plan:', e);
@@ -3533,7 +3839,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             
             let currentBatchPaths: string[] = [];
             let currentBatchSize = 0;
-            const MAX_BATCH_BYTES = 60 * 1024; // 60KB safe limit for WebRTC
+            // Batches are packed then deflated, so the budget is measured against the
+            // estimated ON-WIRE size. Budgeting against raw file.stat.size systematically
+            // under-filled every batch. The 60 KB cap also predated V3: the old envelope
+            // base64'd bodies (+33%), so the effective ceiling was far below the ~256 KB
+            // a data channel actually accepts.
+            const MAX_BATCH_BYTES = 192 * 1024;
 
             for (const path of data.paths) {
                 if (allowed.has(path)) {
@@ -3541,7 +3852,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const file = this.app.vault.getAbstractFileByPath(path);
                     if (file instanceof TFile) {
                         const estimatedOverhead = 16 + path.length * 3; // Approx 3 bytes per char for UTF8 safety
-                        const estimatedSize = file.stat.size + estimatedOverhead;
+                        // Text is compressed before packing and typically lands near a
+                        // third of its original size; binary is assumed incompressible.
+                        const compressionFactor = (this.settings.enableCompression && !this.isBinary(file.extension)) ? 0.4 : 1;
+                        const estimatedSize = Math.ceil(file.stat.size * compressionFactor) + estimatedOverhead;
 
                         if (estimatedSize >= MAX_BATCH_BYTES) {
                             // Too large for binary batch, send normally (will chunk if needed)
@@ -3619,6 +3933,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 const retries = this.pullRetries.get(path) || 0;
                 if (retries < 3) {
                     this.pullRetries.set(path, retries + 1);
+                    // The pull cursor only moves forward, so a path being retried has to
+                    // be re-appended or it would never be requested again.
+                    this.pullOrder.push(path);
                 } else {
                     pending.delete(path);
                     this.pullRetries.delete(path);
@@ -3645,6 +3962,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
     
+    /**
+     * Establish the smallest-first pull order for a sync plan, once.
+     *
+     * requestNextBatch used to rebuild an array from pendingPulls and re-sort it on every
+     * iteration of its own while loop AND again on every batch-complete — O(n log n) over
+     * the entire pending set per batch. The order is now computed once and consumed
+     * through a cursor.
+     */
+    private initPullOrder(paths: Iterable<string>) {
+        this.pullOrder = Array.from(paths);
+        this.pullOrder.sort((a, b) => (this.peerFileSizes[a] || 0) - (this.peerFileSizes[b] || 0));
+        this.pullCursor = 0;
+    }
+
     requestNextBatch(peerId: string) {
         if (this.syncState.currentPhase !== SyncPhase.TRANSFERRING && this.syncState.currentPhase !== SyncPhase.PLANNING) return;
         const pending = this.syncState.pendingPulls;
@@ -3652,40 +3983,46 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.checkFullSyncCompletion(peerId);
             return;
         }
-        
+
         if (!this.syncState.activePullBatches) this.syncState.activePullBatches = new Set();
         if (!this.syncState.inFlightPulls) this.syncState.inFlightPulls = new Set();
-        
+
         while (this.syncState.activePullBatches.size < this.syncState.adaptiveConfig.maxActiveBatches) {
-            // Avoid Array.from().filter() intermediate allocations — iterate the Set directly
             const inFlight = this.syncState.inFlightPulls;
-            const availablePending: string[] = [];
-            for (const p of pending) {
-                if (!inFlight.has(p)) availablePending.push(p);
+
+            // Skip entries the cursor has passed that are no longer eligible: already
+            // received (dropped from pending), or currently in flight in another batch.
+            while (this.pullCursor < this.pullOrder.length) {
+                const p = this.pullOrder[this.pullCursor];
+                if (pending.has(p) && !inFlight.has(p)) break;
+                this.pullCursor++;
             }
-            if (availablePending.length === 0) {
+
+            if (this.pullCursor >= this.pullOrder.length) {
                 if (this.syncState.activePullBatches.size === 0) {
                     this.checkFullSyncCompletion(peerId);
                 }
                 break;
             }
 
-            this.transitionToPhase(SyncPhase.TRANSFERRING);        
+            this.transitionToPhase(SyncPhase.TRANSFERRING);
             const paths: string[] = [];
             let totalSize = 0;
-            
-            const sortedPending = availablePending.sort((a, b) => (this.peerFileSizes[a] || 0) - (this.peerFileSizes[b] || 0));
-            
-            for (const path of sortedPending) {
+
+            while (this.pullCursor < this.pullOrder.length) {
+                const path = this.pullOrder[this.pullCursor];
+                if (!pending.has(path) || inFlight.has(path)) { this.pullCursor++; continue; }
+
                 const size = this.peerFileSizes[path] || 0;
                 if (paths.length >= this.syncState.adaptiveConfig.filesPerBatch || (totalSize + size > this.syncState.adaptiveConfig.maxBytesPerBatch && paths.length > 0)) {
                     break;
                 }
                 paths.push(path);
                 totalSize += size;
-                this.syncState.inFlightPulls.add(path);
+                inFlight.add(path);
+                this.pullCursor++;
             }
-            
+
             this.log(`Requesting batch of ${paths.length} files (${formatBytes(totalSize)}). Active batches: ${this.syncState.activePullBatches.size + 1}/${this.syncState.adaptiveConfig.maxActiveBatches}`);
             const batchId = this.generateTransferId('batch');
             this.syncState.activePullBatches.add(batchId);
@@ -3735,13 +4072,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncState.inFlightPulls?.clear();
         this.syncState.allowedPulls.clear();
         this.pullRetries.clear();
+        this.pullOrder = [];
+        this.pullCursor = 0;
         this.syncState.activeBatches.clear();
         this.syncState.activePullBatches?.clear();
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
         this.syncState.peerId = null;
         this.peerFileSizes = {};
-        this.processQueue(); 
+        this.processQueue();
         this.updateStatus(); 
         this.showNotice(`Sync complete. Transferred ${this.syncState.filesTransferred} files.`, 'important'); 
     }
@@ -3757,23 +4096,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         const manifest: VaultManifest = []; 
         const allFiles = this.app.vault.getAllLoadedFiles(); 
 
+        // Yield on a time budget rather than every 50 files. A 20k-file vault produced
+        // ~400 macrotask yields, and browser timer clamping turned that into seconds of
+        // pure scheduling latency inside a phase that has a 120 s timeout.
+        const twoDevice = this.currentSyncIsTwoDeviceMode ?? this.isTwoDeviceMode();
         let count = 0;
-        for (const file of allFiles) { 
-            if (this.isPathSyncable(file.path)) { 
-                if (file instanceof TFolder) { 
-                    if (file.path !== '/') manifest.push({ type: 'folder', path: file.path }); 
-                } else if (file instanceof TFile) { 
-                    let hash = this.syncedHashes.get(file.path)?.hash;
-                    let vv = (this.currentSyncIsTwoDeviceMode ?? this.isTwoDeviceMode()) ? this.twoDeviceState.fileVersions[file.path] : undefined;
-                    manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash, versionVector: vv }); 
-                    
+        let lastYield = Date.now();
+        for (const file of allFiles) {
+            if (this.isPathSyncable(file.path)) {
+                if (file instanceof TFolder) {
+                    if (file.path !== '/') manifest.push({ type: 'folder', path: file.path });
+                } else if (file instanceof TFile) {
+                    const hash = this.syncedHashes.get(file.path)?.hash;
+                    const vv = twoDevice ? this.twoDeviceState.fileVersions[file.path] : undefined;
+                    manifest.push({ type: 'file', path: file.path, mtime: file.stat.mtime, size: file.stat.size, hash, versionVector: vv });
                     count++;
-                    if (count % 50 === 0) {
+
+                    if (Date.now() - lastYield > 8) {
                         this.updateStatus({ text: `Building manifest (${count}/${allFiles.length})...`, icon: 'loader', spin: true, state: 'loading' });
                         await new Promise(r => setTimeout(r, 0));
+                        lastYield = Date.now();
                     }
-                } 
-            } 
+                }
+            }
         }
         for (const [path, timestamp] of Object.entries(this.tombstones)) {
             manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0 });
@@ -3790,8 +4135,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
         if (path.startsWith('.obsidian/')) {
             if (this.settings.syncMode === 'auto') {
-                const safePaths = ['.obsidian/snippets/', '.obsidian/themes/', '.obsidian/appearance.json'];
-                return safePaths.some(safe => path.startsWith(safe));
+                return AUTO_SAFE_CONFIG_PATHS.some(safe => path.startsWith(safe));
             } else {
                 return this.settings.syncObsidianConfig;
             }
@@ -3805,7 +4149,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         return true;
     }
-    public isBinary(extension: string): boolean { const textExtensions = ['md', 'txt', 'json', 'css', 'js', 'html', 'xml', 'csv', 'yaml', 'toml']; return !textExtensions.includes((extension || '').toLowerCase()); }
+    // Set lookup against a module-level constant. This allocated a fresh 10-element
+    // array literal on every call, and it is called several times per file per sync.
+    public isBinary(extension: string): boolean { return !TEXT_EXTENSIONS.has((extension || '').toLowerCase()); }
     private async areArrayBuffersEqual(buf1: ArrayBuffer, buf2: ArrayBuffer): Promise<boolean> { 
         if (buf1.byteLength !== buf2.byteLength) return false; 
         if (buf1.byteLength < 50 * 1024) {
@@ -3822,18 +4168,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
     private shouldIgnoreEvent(path: string): boolean { const ignoreUntil = this.ignoreEvents.get(path); if (ignoreUntil && Date.now() < ignoreUntil) { return true; } this.ignoreEvents.delete(path); return false; }
     public ignoreNextEventForPath(path: string, durationMs = 2000) { this.ignoreEvents.set(path, Date.now() + durationMs); }
+    /**
+     * Path for a conflict copy. Suffixed with a counter when needed: the date alone meant
+     * a second conflict on the same file the same day overwrote the first copy, losing
+     * the very content the conflict file exists to preserve.
+     */
     getConflictPath(originalPath: string): string {
         const date = new Date().toISOString().split('T')[0];
         const lastDot = originalPath.lastIndexOf('.');
         const lastSlash = originalPath.lastIndexOf('/');
-        if (lastDot > lastSlash) {
-            // Has a file extension
-            const base = originalPath.substring(0, lastDot);
-            const extension = originalPath.substring(lastDot + 1);
-            return `${base} (conflict on ${date}).${extension}`;
+        const hasExtension = lastDot > lastSlash;
+        const base = hasExtension ? originalPath.substring(0, lastDot) : originalPath;
+        const extension = hasExtension ? originalPath.substring(lastDot + 1) : '';
+
+        const build = (suffix: string) => hasExtension
+            ? `${base} (conflict on ${date}${suffix}).${extension}`
+            : `${base} (conflict on ${date}${suffix})`;
+
+        let candidate = build('');
+        for (let n = 2; this.app.vault.getAbstractFileByPath(candidate) && n < 1000; n++) {
+            candidate = build(` ${n}`);
         }
-        // No extension (e.g. README, Makefile)
-        return `${originalPath} (conflict on ${date})`;
+        return candidate;
     }
     getLocalIp(): string | null { if (Platform.isMobile) return null; try { const os = require('os'); const interfaces = os.networkInterfaces(); for (const name in interfaces) { for (const net of interfaces[name]!) { if (net.family === 'IPv4' && !net.internal) return net.address; } } } catch (e) { console.warn("Could not get local IP address.", e); } return null; }
     getMyPeerInfo(): PeerInfo {
@@ -3866,7 +4222,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.updateStatus();
 
         // Initiate handshake
-        await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin });
+        await this.directIpClient.send({ type: 'handshake', peerInfo: this.getMyPeerInfo(), pin: config.pin, protocolVersion: PROTOCOL_VERSION });
     }
     
 
@@ -3919,31 +4275,63 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         return { text: "Online", icon: "globe", state: 'neutral' };
     }
 
+    private static readonly STATUS_COLORS: Record<SyncStatusState['state'], string> = {
+        error: 'var(--text-error)',
+        success: 'var(--text-success)',
+        loading: 'var(--interactive-accent)',
+        neutral: 'var(--text-muted)',
+    };
+
+    /**
+     * Update the status bar, rebuilding DOM only when something actually changed.
+     *
+     * This is called from ~26 sites, including inside the chunk send loop. It used to
+     * empty() the status bar item and re-run setIcon() (which parses and injects an SVG)
+     * on every single call, and the 200 ms throttle did not apply when idle. Now the
+     * elements are created once and only the changed parts are touched.
+     */
     updateStatus(customStatus?: SyncStatusState) {
         const now = Date.now();
-        const isIdle = this.activeTransfers.size === 0 && this.queueManager.getActiveTransfers() === 0 && this.queueManager.getQueueSize() === 0;
-        if (!customStatus && !isIdle && now - this.lastStatusUpdate < 200) return;
+        if (!customStatus && now - this.lastStatusUpdate < 200) return;
         this.lastStatusUpdate = now;
 
         const status = customStatus || this.calculateStatus();
-        this.statusBar.empty();
-        const container = this.statusBar.createDiv({ cls: 'od-status-container' });
 
-        if (status.state === 'loading') {
-            container.addClass('mod-clickable');
-            container.onclick = () => new SyncProgressModal(this.app, this).open();
+        // Build the container once.
+        if (!this.statusIconEl || !this.statusTextEl) {
+            this.statusBar.empty();
+            const container = this.statusBar.createDiv({ cls: 'od-status-container' });
+            container.onclick = () => {
+                if (this.lastRenderedStatus?.state === 'loading') new SyncProgressModal(this.app, this).open();
+            };
+            this.statusContainerEl = container;
+            this.statusIconEl = container.createDiv({ cls: 'od-status-icon' });
+            this.statusTextEl = container.createSpan();
+            this.lastRenderedStatus = null;
         }
 
-        const iconEl = container.createDiv({ cls: 'od-status-icon' });
-        setIcon(iconEl, status.icon);
-        if (status.spin) iconEl.addClass('lucide-spin');
+        const prev = this.lastRenderedStatus;
+        if (prev && prev.text === status.text && prev.icon === status.icon
+            && prev.spin === status.spin && prev.state === status.state) {
+            return;
+        }
 
-        if (status.state === 'error') iconEl.style.color = 'var(--text-error)';
-        else if (status.state === 'success') iconEl.style.color = 'var(--text-success)';
-        else if (status.state === 'loading') iconEl.style.color = 'var(--interactive-accent)';
-        else iconEl.style.color = 'var(--text-muted)';
+        // setIcon replaces the element's children, so only re-run it on a real change.
+        if (!prev || prev.icon !== status.icon) {
+            setIcon(this.statusIconEl, status.icon);
+        }
+        if (!prev || prev.spin !== status.spin) {
+            this.statusIconEl.toggleClass('lucide-spin', !!status.spin);
+        }
+        if (!prev || prev.state !== status.state) {
+            this.statusIconEl.style.color = ObsidianDecentralizedPlugin.STATUS_COLORS[status.state];
+            this.statusContainerEl?.toggleClass('mod-clickable', status.state === 'loading');
+        }
+        if (!prev || prev.text !== status.text) {
+            this.statusTextEl.setText(status.text);
+        }
 
-        container.createSpan({ text: status.text });
+        this.lastRenderedStatus = status;
     }
 }
 

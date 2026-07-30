@@ -716,6 +716,7 @@ export class BinaryConflictResolutionModal extends Modal {
 export class SyncProgressModal extends Modal {
     private container: HTMLElement;
     private refreshInterval: number | null = null;
+    private lastSignature: string | null = null;
 
     constructor(app: App, private plugin: ObsidianDecentralizedPlugin) { super(app); }
 
@@ -733,7 +734,35 @@ export class SyncProgressModal extends Modal {
         this.contentEl.empty();
     }
 
+    /**
+     * Cheap fingerprint of everything this modal displays.
+     *
+     * refresh() tears down and rebuilds the whole subtree, and it runs twice a second
+     * for as long as the modal is open — including when absolutely nothing is happening.
+     * The time bucket is only mixed in while work is in flight, so the elapsed-time and
+     * throughput readouts still tick, but an idle modal settles to zero DOM work.
+     */
+    private stateSignature(): string {
+        const s = this.plugin.syncState;
+        const parts: string[] = [
+            s.isSyncing ? `S${s.currentPhase}|${s.filesTransferred}/${s.filesTotal}|${s.bytesTransferred}/${s.bytesTotal}|${s.currentFile ?? ''}|${s.currentFileSize ?? ''}` : 'S-',
+        ];
+        for (const t of this.plugin.activeTransfers.values()) {
+            parts.push(`T${t.id}:${t.processedChunks}/${t.totalChunks}:${t.status}:${t.direction}`);
+        }
+        for (const f of this.plugin.failedSyncs) {
+            parts.push(`F${f.path}:${f.type}:${f.retryCount}:${f.timestamp}`);
+        }
+        const busy = s.isSyncing || this.plugin.activeTransfers.size > 0;
+        if (busy) parts.push(`t${Math.floor(Date.now() / 1000)}`);
+        return parts.join('\n');
+    }
+
     refresh() {
+        const signature = this.stateSignature();
+        if (signature === this.lastSignature) return;
+        this.lastSignature = signature;
+
         this.container.empty();
         const hasActive = this.plugin.activeTransfers.size > 0;
         const hasFailed = this.plugin.failedSyncs.length > 0;

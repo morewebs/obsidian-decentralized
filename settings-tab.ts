@@ -9,6 +9,8 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     private statusInterval: number | null = null;
     private statusTextEl: HTMLDivElement | null = null;
     private isEditingName = false;
+    /** Fingerprint of the last rendered status, so the 3 s poll can no-op. */
+    private lastStatusSignature: string | null = null;
 
     constructor(app: App, plugin: ObsidianDecentralizedPlugin) {
         super(app, plugin);
@@ -17,6 +19,9 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
 
     display(): void {
         this.isEditingName = false;
+        // The DOM below is rebuilt from scratch, so the previous render's fingerprint
+        // must not suppress the first repaint into the new elements.
+        this.lastStatusSignature = null;
         const { containerEl } = this;
         containerEl.empty();
         containerEl.createEl('h2', { text: 'Obsidian Decentralized' });
@@ -384,8 +389,21 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     }
 
     updateStatus() {
+        // Polled every 3 s while the tab is open. Both sections below are full DOM
+        // rebuilds (setIcon parses an SVG; the cluster list constructs a Setting per
+        // peer), so skip the work entirely when nothing on screen would change.
+        const status = this.plugin.calculateStatus();
+        const peers = Array.from(this.plugin.clusterPeers.values());
+        const signature = [
+            status.text, status.icon, status.state, status.spin ? '1' : '0',
+            peers.map(p => `${p.deviceId}:${p.friendlyName}:${this.plugin.connections.has(p.deviceId) ? 1 : 0}`).join(','),
+            this.plugin.settings.companionPeerId ?? '',
+        ].join('|');
+
+        if (signature === this.lastStatusSignature) return;
+        this.lastStatusSignature = signature;
+
         if (this.statusTextEl) {
-            const status = this.plugin.calculateStatus();
             this.statusTextEl.empty();
             const iconSpan = this.statusTextEl.createSpan({ cls: 'od-status-icon' });
             setIcon(iconSpan, status.icon);
@@ -396,7 +414,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
         if (!this.clusterStatusEl || !this.clusterStatusEl.isConnected) {
             return;
         }
-        if (this.isEditingName) return;
+        if (this.isEditingName) {
+            // Nothing was rendered, so don't let the signature suppress the next pass.
+            this.lastStatusSignature = null;
+            return;
+        }
         this.clusterStatusEl.empty();
 
         const createEntry = (peer: PeerInfo, type: 'self' | 'companion' | 'peer' | 'host' | 'disconnected') => {

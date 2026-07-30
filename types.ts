@@ -117,6 +117,14 @@ export type HandshakePayload = {
     peerInfo: PeerInfo;
     pin?: string;
     isResponse?: boolean;
+    /** Wire protocol version; see PROTOCOL_VERSION in utils.ts. Absent on 2.x peers. */
+    protocolVersion?: number;
+};
+
+export type EncryptedFramePayload = {
+    type: 'encrypted-frame';
+    /** [12B IV][AES-GCM ciphertext of a packFrame buffer] */
+    data: ArrayBuffer | Uint8Array;
 };
 
 export type RoleAnnouncementPayload = {
@@ -245,6 +253,14 @@ export type FileChunkStartPayload = {
     fileHash: string;
     compressed?: boolean;
     versionVector?: VersionVector;
+    /**
+     * Total payload size and the sender's chunk size. V3 additions: with these the
+     * receiver preallocates one buffer and writes each chunk straight to its final
+     * offset, instead of retaining every chunk and then concatenating into a second
+     * full-size buffer (which doubled peak memory for the file).
+     */
+    totalBytes: number;
+    chunkSize: number;
 };
 
 export type FileChunkDataPayload = {
@@ -404,6 +420,7 @@ export interface BatchState {
 
 export type SyncData =
     | HandshakePayload
+    | EncryptedFramePayload
     | RoleAnnouncementPayload
     | ClusterGossipPayload
     | CompanionPairPayload

@@ -73,6 +73,37 @@ export function base64ToArrayBuffer(base64: string): ArrayBuffer {
 }
 
 /**
+ * Run `worker` over every item with at most `limit` in flight.
+ *
+ * Used where the previous code either awaited serially inside a loop (slow) or mapped
+ * everything into Promise.allSettled at once (unbounded — up to 500 concurrent vault
+ * writes during a batch apply). Never rejects: each result carries its own outcome.
+ */
+export async function mapWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    worker: (item: T, index: number) => Promise<R>
+): Promise<PromiseSettledResult<R>[]> {
+    const results: PromiseSettledResult<R>[] = new Array(items.length);
+    let next = 0;
+
+    const runners = new Array(Math.min(Math.max(1, limit), items.length)).fill(0).map(async () => {
+        for (;;) {
+            const i = next++;
+            if (i >= items.length) return;
+            try {
+                results[i] = { status: 'fulfilled', value: await worker(items[i], i) };
+            } catch (reason) {
+                results[i] = { status: 'rejected', reason };
+            }
+        }
+    });
+
+    await Promise.all(runners);
+    return results;
+}
+
+/**
  * Wire protocol version. Bumped for V3, which replaced the base64-in-JSON
  * encryption envelope with a binary frame. A V3 peer cannot talk to a 2.x peer,
  * so the handshake refuses mismatched versions rather than corrupting a vault.
@@ -84,6 +115,7 @@ const BINARY_BODY_FIELD: Record<string, 'data' | 'content'> = {
     'file-chunk-data': 'data',
     'file-batch-binary': 'data',
     'encrypted-frame': 'data',
+    'sync-control-binary': 'data',
     'file-update': 'content',
 };
 

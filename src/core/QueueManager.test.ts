@@ -100,6 +100,65 @@ describe('QueueManager', () => {
         expect(manager.getActiveTransfers()).toBe(0);
     });
 
+    test('heap drains strictly in priority order for a large shuffled batch', async () => {
+        manager.pause();
+        manager.setConcurrencyLimit(1);
+
+        // Interleaved priorities, inserted in an order unrelated to drain order.
+        const priorities: number[] = [];
+        for (let i = 0; i < 500; i++) {
+            const p = ((i * 37) % 101);
+            priorities.push(p);
+            manager.addToQueue({ id: `item-${i}`, peerId: 'A', retries: 0, priority: p });
+        }
+        expect(manager.getQueueSize()).toBe(500);
+
+        manager.resume();
+        for (let i = 0; i < 5000; i++) await Promise.resolve();
+
+        expect(processCallback).toHaveBeenCalledTimes(500);
+        const drained = processCallback.mock.calls.map(c => c[0].priority);
+        const expected = [...priorities].sort((a, b) => b - a);
+        expect(drained).toEqual(expected);
+    });
+
+    test('equal priorities drain FIFO', async () => {
+        manager.pause();
+        manager.setConcurrencyLimit(1);
+        for (let i = 0; i < 20; i++) {
+            manager.addToQueue({ id: `fifo-${i}`, peerId: 'A', retries: 0, priority: 7 });
+        }
+        manager.resume();
+        for (let i = 0; i < 2000; i++) await Promise.resolve();
+
+        const ids = processCallback.mock.calls.map(c => c[0].id);
+        expect(ids).toEqual(Array.from({ length: 20 }, (_, i) => `fifo-${i}`));
+    });
+
+    test('repeated work for the same id collapses to a single queue entry', () => {
+        manager.pause();
+        for (let i = 0; i < 100; i++) {
+            manager.addToQueue({ id: 'A send-file notes/note.md', peerId: 'A', retries: 0, priority: 50000 });
+        }
+        expect(manager.getQueueSize()).toBe(1);
+        manager.resume();
+    });
+
+    test('loadQueue drops duplicate ids and preserves priority order', async () => {
+        manager.pause();
+        manager.setConcurrencyLimit(1);
+        manager.loadQueue([
+            { id: 'a', peerId: null, retries: 0, priority: 1, task: { taskType: 'send-delete', path: 'a' } },
+            { id: 'b', peerId: null, retries: 0, priority: 100, task: { taskType: 'send-delete', path: 'b' } },
+            { id: 'a', peerId: null, retries: 0, priority: 999, task: { taskType: 'send-delete', path: 'a' } },
+        ]);
+        expect(manager.getQueueSize()).toBe(2);
+
+        manager.resume();
+        for (let i = 0; i < 100; i++) await Promise.resolve();
+        expect(processCallback.mock.calls.map(c => c[0].id)).toEqual(['b', 'a']);
+    });
+
     test('should call syncDrainCallback when queue is empty and no retries pending', async () => {
         const drainCallback = jest.fn();
         manager.setSyncDrainCallback(drainCallback);
