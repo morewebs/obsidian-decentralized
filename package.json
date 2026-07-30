@@ -3,6 +3,9 @@
   "version": "3.0.0",
   "description": "Sync your vault across devices without a central server using WebRTC (PeerJS) or Direct IP connections.",
   "main": "main.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "rollup --config rollup.config.mjs -w",
     "build": "rollup --config rollup.config.mjs --environment BUILD:production",

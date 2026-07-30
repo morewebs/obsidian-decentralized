@@ -14,7 +14,9 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [18.x, 20.x, 22.x]
+        # Node 18 dropped: it is past EOL, and the production build's minifier chain
+        # requires the global crypto object introduced in Node 19.
+        node-version: [20.x, 22.x]
 
     steps:
     - uses: actions/checkout@v4

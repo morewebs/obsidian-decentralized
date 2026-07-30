@@ -36,7 +36,10 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          # >=20 required: the production build minifies via @rollup/plugin-terser,
+          # whose serialize-javascript dependency calls the global crypto object at
+          # module load. That global does not exist on Node 18 (added in 19).
+          node-version: 20
           cache: 'npm'
 
       - name: Bump versions
