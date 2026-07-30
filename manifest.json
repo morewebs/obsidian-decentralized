@@ -1,7 +1,7 @@
 {
   "id": "obsidian-decentralized",
   "name": "Obsidian Decentralized",
-  "version": "3.0.0",
+  "version": "v2.9.9",
   "minAppVersion": "1.8.3",
   "description": "A free, private, and local-first sync solution for Obsidian.md. Your notes travel directly between your devices, with no central server involved.",
   "author": "moreweb",
