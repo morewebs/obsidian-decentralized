@@ -1,6 +1,6 @@
 {
   "name": "obsidian-decentralized-sync",
-  "version": "2.9.9",
+  "version": "2.9.10-preview",
   "description": "Sync your vault across devices without a central server using WebRTC (PeerJS) or Direct IP connections.",
   "main": "main.js",
   "engines": {
