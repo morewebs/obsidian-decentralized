@@ -16,8 +16,13 @@
   "14": "Discovery Types",
   "15": "Git Log Analysis",
   "16": "Graphify Agent Rule",
+  "17": "Graphify Workflow",
   "18": "Rollup Configuration",
   "19": "Sync Error Types",
+  "20": "Graphify Rule Sub-component",
+  "21": "Graphify Report Rule",
+  "22": "Agent Tools Configuration",
+  "23": "Graphify Workflow Logic",
   "24": "GitHub Actions Workflow",
   "25": "Jest Configuration",
   "26": "Readme Companion Mode",
@@ -25,5 +30,10 @@
   "28": "Readme LAN Discovery",
   "29": "Readme PeerJS",
   "30": "Readme Signaling Server",
-  "31": "Readme WebRTC"
+  "31": "Readme WebRTC",
+  "32": "Crypto Worker",
+  "33": "FileManager",
+  "34": ".broadcastData",
+  "35": "BinaryConflictResolutionModal",
+  "36": "QRScannerModal"
 }

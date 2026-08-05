@@ -1,16 +1,16 @@
-# Graph Report - obsidian-decentralized  (2026-08-05)
+# Graph Report - obsidian-decentralized  (2026-07-12)
 
 ## Corpus Check
-- 25 files · ~38,263 words
+- 30 files · ~32,992 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 541 nodes · 1371 edges · 27 communities (18 shown, 9 thin omitted)
+- 521 nodes · 1264 edges · 37 communities (17 shown, 20 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `3d90ee61`
+- Built from commit: `d1d52bc2`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -24,6 +24,7 @@
 - [[_COMMUNITY_Modals and Conflict Center|Modals and Conflict Center]]
 - [[_COMMUNITY_LAN Discovery|LAN Discovery]]
 - [[_COMMUNITY_Documentation|Documentation]]
+- [[_COMMUNITY_Obsidian API Mocks|Obsidian API Mocks]]
 - [[_COMMUNITY_TypeScript Configuration|TypeScript Configuration]]
 - [[_COMMUNITY_Plugin Manifest|Plugin Manifest]]
 - [[_COMMUNITY_Test Utilities|Test Utilities]]
@@ -31,7 +32,12 @@
 - [[_COMMUNITY_Discovery Types|Discovery Types]]
 - [[_COMMUNITY_Git Log Analysis|Git Log Analysis]]
 - [[_COMMUNITY_Graphify Agent Rule|Graphify Agent Rule]]
+- [[_COMMUNITY_Graphify Workflow|Graphify Workflow]]
 - [[_COMMUNITY_Sync Error Types|Sync Error Types]]
+- [[_COMMUNITY_Graphify Rule Sub-component|Graphify Rule Sub-component]]
+- [[_COMMUNITY_Graphify Report Rule|Graphify Report Rule]]
+- [[_COMMUNITY_Agent Tools Configuration|Agent Tools Configuration]]
+- [[_COMMUNITY_Graphify Workflow Logic|Graphify Workflow Logic]]
 - [[_COMMUNITY_GitHub Actions Workflow|GitHub Actions Workflow]]
 - [[_COMMUNITY_Readme Companion Mode|Readme Companion Mode]]
 - [[_COMMUNITY_Readme Direct IP|Readme Direct IP]]
@@ -39,30 +45,34 @@
 - [[_COMMUNITY_Readme PeerJS|Readme PeerJS]]
 - [[_COMMUNITY_Readme Signaling Server|Readme Signaling Server]]
 - [[_COMMUNITY_Readme WebRTC|Readme WebRTC]]
+- [[_COMMUNITY_FileManager|FileManager]]
+- [[_COMMUNITY_.broadcastData|.broadcastData]]
+- [[_COMMUNITY_BinaryConflictResolutionModal|BinaryConflictResolutionModal]]
+- [[_COMMUNITY_QRScannerModal|QRScannerModal]]
 
 ## God Nodes (most connected - your core abstractions)
-1. `ObsidianDecentralizedPlugin` - 175 edges
-2. `QueueManager` - 21 edges
-3. `DesktopLANDiscovery` - 18 edges
-4. `DirectIpClient` - 16 edges
-5. `compilerOptions` - 16 edges
-6. `ConnectionModal` - 16 edges
-7. `TimeoutManager` - 15 edges
-8. `PeerInfo` - 15 edges
-9. `ILANDiscovery` - 13 edges
-10. `DirectIpServer` - 12 edges
+1. `ObsidianDecentralizedPlugin` - 162 edges
+2. `TimeoutManager` - 19 edges
+3. `ConnectionModal` - 17 edges
+4. `DesktopLANDiscovery` - 16 edges
+5. `QueueManager` - 16 edges
+6. `compilerOptions` - 16 edges
+7. `DirectIpClient` - 15 edges
+8. `PeerInfo` - 13 edges
+9. `DirectIpServer` - 12 edges
+10. `ILANDiscovery` - 12 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `encodeMessage()` --calls--> `packFrame()`  [EXTRACTED]
-  directip.ts → utils.ts
-- `encodeMessage()` --calls--> `splitBinaryPayload()`  [EXTRACTED]
-  directip.ts → utils.ts
 - `ObsidianDecentralizedPlugin` --references--> `DirectIpServer`  [EXTRACTED]
   main.ts → directip.ts
 - `ObsidianDecentralizedPlugin` --references--> `DirectIpClient`  [EXTRACTED]
   main.ts → directip.ts
+- `DesktopLANDiscovery` --references--> `PeerInfo`  [EXTRACTED]
+  discovery.ts → types.ts
 - `ObsidianDecentralizedPlugin` --references--> `ConnectionManager`  [EXTRACTED]
   main.ts → src/core/ConnectionManager.ts
+- `ObsidianDecentralizedPlugin` --references--> `FileManager`  [EXTRACTED]
+  main.ts → src/core/FileManager.ts
 
 ## Import Cycles
 - None detected.
@@ -70,39 +80,39 @@
 ## Hyperedges (group relationships)
 - **Performance Optimizations** — git_log_gethash_optimization, git_log_hash_cache_eviction, git_log_large_file_hashing, git_log_cached_read [INFERRED 0.95]
 
-## Communities (27 total, 9 thin omitted)
+## Communities (37 total, 20 thin omitted)
 
 ### Community 0 - "Main Plugin Controller"
 Cohesion: 0.08
-Nodes (7): ObsidianDecentralizedPlugin, DeviceRole, FileUpdatePayload, MerkleNode, SyncData, SyncTask, VersionVector
+Nodes (4): ObsidianDecentralizedPlugin, diff-match-patch, FileUpdatePayload, VersionVector
 
 ### Community 1 - "Type Definitions"
 Cohesion: 0.06
-Nodes (55): AUTO_SAFE_CONFIG_PATHS, dmp, NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks inter, NOTE: do NOT send 'batch-complete' from here. The batchId belongs to, TEXT_EXTENSIONS, TEXT_WHITELIST, AckPayload, AdaptiveSyncConfig (+47 more)
+Nodes (55): NOTE: lastSentContent eviction is handled by the 60-s cleanupPendingChunks inter, AckPayload, AdaptiveSyncConfig, BasePayload, BatchCompletePayload, BatchState, ClusterForgetPayload, ClusterGossipPayload (+47 more)
 
 ### Community 2 - "Core Managers and Utilities"
-Cohesion: 0.10
-Nodes (4): ConnectionManager, QueueItem, QueueManager, TimeoutManager
+Cohesion: 0.09
+Nodes (9): ConnectionManager, QueueItem, QueueManager, TODO: implement loadQueueFromDisk() using IndexedDB or vault adapter to survive, TODO: implement saveQueueToDisk() to persist queue state; call it on addToQueue/, TODO: call loadQueueFromDisk() here once IndexedDB persistence is implemented, SyncEngine, TimeoutManager (+1 more)
 
 ### Community 3 - "UI and Connection Handling"
 Cohesion: 0.09
-Nodes (6): ObsidianDecentralizedSettingTab, ClusterForgetPayload, ClusterGossipPayload, ClusterRenamePayload, SyncStatusState, ConnectionModal
+Nodes (3): ObsidianDecentralizedSettingTab, SyncStatusState, ConnectionModal
 
 ### Community 4 - "Direct IP and Websockets"
-Cohesion: 0.11
-Nodes (6): DirectIpClient, DirectIpServer, encodeMessage(), MockWebSocket, MockWebSocketServer, ws
+Cohesion: 0.08
+Nodes (15): decodeMessage(), DirectIpClient, DirectIpServer, encodeMessage(), ServerClientEntry, textDecoder, textEncoder, MockWebSocket (+7 more)
 
 ### Community 5 - "Package Config and Conflict UI"
-Cohesion: 0.05
-Nodes (35): author, dependencies, diff-match-patch, html5-qrcode, pako, peerjs, qrcode, description (+27 more)
+Cohesion: 0.04
+Nodes (30): Modal, Notice, Platform, Setting, TFile, author, description, devDependencies (+22 more)
 
 ### Community 6 - "Modals and Conflict Center"
-Cohesion: 0.10
-Nodes (6): Modal, Notice, Platform, Setting, TFile, obsidian
+Cohesion: 0.15
+Nodes (6): DEFAULT_SETTINGS, DiscoveryBeacon, PeerInfo, formatBytes(), SelectPeerModal, SyncProgressModal
 
 ### Community 7 - "LAN Discovery"
-Cohesion: 0.08
-Nodes (6): DesktopLANDiscovery, DummyLANDiscovery, MockSocket, DiscoveryBeacon, ILANDiscovery, PeerInfo
+Cohesion: 0.11
+Nodes (3): DesktopLANDiscovery, DummyLANDiscovery, ILANDiscovery
 
 ### Community 8 - "Documentation"
 Cohesion: 0.10
@@ -120,37 +130,33 @@ Nodes (8): author, authorUrl, description, id, isDesktopOnly, minAppVersion, nam
 Cohesion: 0.28
 Nodes (7): assert(), assertEquals(), fs, Module, obsidian, path, runTests()
 
-### Community 14 - "Discovery Types"
-Cohesion: 0.07
-Nodes (9): BinaryConflictResolutionModal, ConflictCenter, ConflictListModal, formatBytes(), loadHtml5Qrcode(), loadQRCode(), QRScannerModal, SelectPeerModal (+1 more)
-
 ### Community 15 - "Git Log Analysis"
 Cohesion: 0.33
 Nodes (6): Use cachedRead, getHash Optimization, Map Insertion Order Eviction, Large File Stat Hashing, ObsidianDecentralizedPlugin, Rename Vector Cache Transfer
 
 ### Community 19 - "Sync Error Types"
-Cohesion: 0.15
-Nodes (21): decodeMessage(), IMPORTANT: 'ws' delivers TEXT frames as a Node Buffer too, and Buffer IS, ServerClientEntry, DirectIpConfig, FileBatchBinaryPayload, SyncErrorCategory, arrayBufferToBase64(), base64ToArrayBuffer() (+13 more)
+Cohesion: 0.20
+Nodes (12): FileBatchBinaryPayload, SyncError, SyncErrorCategory, arrayBufferToBase64(), base64ToArrayBuffer(), compressText(), decompressText(), PackedFile (+4 more)
 
 ## Knowledge Gaps
-- **98 isolated node(s):** `Platform`, `ServerClientEntry`, `dmp`, `id`, `name` (+93 more)
+- **103 isolated node(s):** `Platform`, `textEncoder`, `textDecoder`, `ServerClientEntry`, `id` (+98 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **9 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **20 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ObsidianDecentralizedPlugin` connect `Main Plugin Controller` to `Type Definitions`, `Core Managers and Utilities`, `UI and Connection Handling`, `Direct IP and Websockets`, `Package Config and Conflict UI`, `LAN Discovery`, `Obsidian API Mocks`, `Discovery Types`, `Sync Error Types`?**
-  _High betweenness centrality (0.364) - this node is a cross-community bridge._
-- **Why does `dependencies` connect `Package Config and Conflict UI` to `Direct IP and Websockets`?**
-  _High betweenness centrality (0.146) - this node is a cross-community bridge._
-- **Why does `diff-match-patch` connect `Package Config and Conflict UI` to `Main Plugin Controller`?**
+- **Why does `ObsidianDecentralizedPlugin` connect `Main Plugin Controller` to `Type Definitions`, `.broadcastData`, `UI and Connection Handling`, `Direct IP and Websockets`, `Core Managers and Utilities`, `FileManager`, `LAN Discovery`, `Modals and Conflict Center`, `Discovery Types`, `Sync Error Types`?**
+  _High betweenness centrality (0.349) - this node is a cross-community bridge._
+- **Why does `dependencies` connect `Direct IP and Websockets` to `Main Plugin Controller`, `Package Config and Conflict UI`?**
+  _High betweenness centrality (0.139) - this node is a cross-community bridge._
+- **Why does `diff-match-patch` connect `Main Plugin Controller` to `Obsidian API Mocks`, `Direct IP and Websockets`?**
   _High betweenness centrality (0.127) - this node is a cross-community bridge._
-- **What connects `Platform`, `ServerClientEntry`, `IMPORTANT: 'ws' delivers TEXT frames as a Node Buffer too, and Buffer IS` to the rest of the system?**
-  _106 weakly-connected nodes found - possible documentation gaps or missing edges._
+- **What connects `Platform`, `textEncoder`, `textDecoder` to the rest of the system?**
+  _112 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `Main Plugin Controller` be split into smaller, more focused modules?**
-  _Cohesion score 0.07656380316930776 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08040404040404041 - nodes in this community are weakly interconnected._
 - **Should `Type Definitions` be split into smaller, more focused modules?**
-  _Cohesion score 0.05565638233514821 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.05952380952380952 - nodes in this community are weakly interconnected._
 - **Should `Core Managers and Utilities` be split into smaller, more focused modules?**
-  _Cohesion score 0.09879032258064516 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08858858858858859 - nodes in this community are weakly interconnected._

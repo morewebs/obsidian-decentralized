@@ -737,6 +737,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' = 'info', timeout?: number) {
+        if (!this.settings.showToasts) {
+            return;
+        }
         if (level === 'error') {
             new Notice(`[Error] ${message}`, timeout || 10000);
             return;
@@ -747,9 +750,6 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (level === 'important') {
             new Notice(message, timeout);
-            return;
-        }
-        if (!this.settings.showToasts) {
             return;
         }
         if (level === 'verbose' && !this.settings.verboseLogging) {
