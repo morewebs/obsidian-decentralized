@@ -1,6 +1,6 @@
 {
   "name": "obsidian-decentralized-sync",
-  "version": "2.9.10-preview",
+  "version": "3.0.0",
   "description": "Sync your vault across devices without a central server using WebRTC (PeerJS) or Direct IP connections.",
   "main": "main.js",
   "engines": {
@@ -44,5 +44,13 @@
     "ts-jest": "^29.4.11",
     "tslib": "^2.5.0",
     "typescript": "^4.9.5"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iwebbio/obsidian-decentralized.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iwebbio/obsidian-decentralized/issues"
+  },
+  "homepage": "https://github.com/iwebbio/obsidian-decentralized#readme"
 }

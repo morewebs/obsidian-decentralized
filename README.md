@@ -57,80 +57,61 @@ This plugin uses **PeerJS**, which leverages **WebRTC** technology. Think of it 
 
 1.  **The Matchmaker (Signaling Server):** When you want to connect two devices, they both check in with a public "signaling server." This server is like a switchboard operator; it introduces your devices to each other and helps them establish a direct communication channel.
 2.  **The Direct Line (P2P Connection):** Once the introduction is made, the signaling server steps away. Your devices then communicate **directly** with each other.
-3.  **Data Transfer:** All your files, changes, and deletions are sent over this secure, direct, end-to-end encrypted channel. **Your notes are never stored on any third-party server.**
+3.  **Data Transfer:** All your files, changes, and deletions are sent over this direct, encrypted channel. **Your notes are never stored on any third-party server.** See [Security and Privacy](#-security-and-privacy) for exactly what "encrypted" covers.
 
 For LAN connections, the plugin can also use multicast UDP packets to broadcast its presence, allowing for automatic discovery without relying on an internet-based signaling server.
 
 ## 📥 Manual Installation
 
-This plugin must be installed manually.
-
 1.  Go to the [**Releases**](https://github.com/iWebbIO/obsidian-decentralized/releases) page on GitHub.
-2.  Download the `main.js` and `manifest.json` files from the latest release.
-3.  Navigate to your Obsidian vault's plugins folder. This is typically located at `<YourVault>/.obsidian/plugins/`.
-    -   If you don't see a `.obsidian` folder, you may need to enable "Show hidden files" in your file explorer.
-4.  Create a new folder inside the `plugins` directory. Name it `obsidian-decentralized`.
-5.  Copy the `main.js`and `manifest.json` files you downloaded into this new folder.
-6.  Restart Obsidian or reload the plugins by going to `Settings` -> `Community Plugins` and toggling a different plugin off and on.
-7.  Go to `Settings` -> `Community Plugins`. You should now see "Obsidian Decentralized" in the list.
+2.  Download **`main.js`**, **`manifest.json`**, and **`styles.css`** from the latest release. All three are required — without `styles.css` the pairing screens render unstyled.
+3.  Navigate to your Obsidian vault's plugins folder, typically `<YourVault>/.obsidian/plugins/`.
+    -   If you don't see a `.obsidian` folder, enable "Show hidden files" in your file explorer.
+4.  Create a new folder inside `plugins` named `obsidian-decentralized`.
+5.  Copy all three downloaded files into it.
+6.  Restart Obsidian, or go to `Settings` → `Community Plugins` and toggle another plugin off and on.
+7.  Go to `Settings` → `Community Plugins`. "Obsidian Decentralized" should now be listed.
 8.  Click the toggle to **enable** the plugin.
 
 ## 🚀 Getting Started: Connecting Your First Devices
 
 First, give your device a memorable name in the plugin settings (e.g., "My Desktop," "My Phone"). This makes it easier to identify.
 
-Then, open the connection helper by clicking the **Connect Devices** button in settings, or the **`users`** icon in the ribbon.
+Then open the connection helper: the **Connect Devices** button in settings, the **`users`** ribbon icon, or the "Connect to a device" command.
 
-### Method A: LAN Discovery (Easiest, LAN Only)
+The helper has two tabs — **Quick Pair** and **Advanced**.
 
-Use this when both devices are on the same Wi-Fi network. This method does not require an internet connection.
+### Method A: Quick Pair (recommended)
 
-**On Device A (e.g., your Desktop):**
-1.  Open the Connection Modal.
-2.  Go to `PeerJS Connection` -> `One-Time Connection`.
-3.  Click `Invite with PIN`.
-4.  The modal will display a 4-digit PIN.
+Quick Pair shows your device's pairing code and a QR code, and lists other devices it finds on your Wi-Fi network.
 
-**On Device B (e.g., your Phone):**
-1.  Open the Connection Modal.
-2.  Go to `PeerJS Connection` -> `One-Time Connection`.
-3.  Click `Join a Network`.
-4.  You should see "Device A" appear in the "Discovered on LAN" list.
-5.  Tap on it and enter the 4-digit PIN from Device A.
+**On Device A (e.g. your desktop):**
+1.  Open the connection helper and stay on the **Quick Pair** tab.
+2.  Either leave the QR code on screen, or press **Copy** to copy the pairing code.
 
-You're connected!
+**On Device B (e.g. your phone):**
+1.  Open the connection helper on the **Quick Pair** tab.
+2.  Either scan Device A's QR code with **Scan QR Code**, or paste the copied code into the input and press **Connect**.
+3.  Alternatively, if both devices are on the same Wi-Fi, Device A should appear under "Or connect to nearby devices" — tap it.
 
-### Method B: By ID / QR Code (Works over Internet)
+> **🔑 Use the copied code, not the short device ID.** The copied code carries the encryption key as well as the device ID, and it is what turns on end-to-end encryption for the link. Treat it as a secret — anyone who has it can pair with you. Connecting by bare device ID (including by tapping a nearby device) pairs without a key.
 
-Use this if your devices are on different networks, or if LAN discovery fails.
+### Method B: Primary sync partner (for automatic reconnection)
 
-**On Device A:**
-1.  Open the Connection Modal -> `PeerJS Connection` -> `One-Time Connection`.
-2.  Click `Show ID`. A unique ID and a QR code for your device will be displayed.
-3.  Click `Copy ID`.
+Once two devices have paired, you can mark one as the primary partner so they reconnect automatically.
 
-**On Device B:**
-1.  Open the Connection Modal -> `PeerJS Connection` -> `One-Time Connection`.
-2.  Click `Join a Network`.
-3.  Paste the ID from Device A into the "Peer ID" field and click `Connect with ID`. (Alternatively, if you're on mobile, you could scan the QR code).
+1.  Open `Settings` → `Obsidian Decentralized` and find the device under **Current Cluster**.
+2.  Click the **star** icon ("Set as Primary Sync Partner").
 
-### Method C: Companion Mode (For Convenience)
+### Method C: Offline Mode (no internet at all)
 
-Set a primary device (like your desktop) as a "companion" for your other devices (like your phone) for automatic reconnection.
+See [Offline Mode](#offline-mode-no-signaling-server) below.
 
-1.  **On your main device (e.g., Desktop):** Get its ID using Method B (`Show ID`).
-2.  **On your secondary device (e.g., Phone):**
-    -   Open the Connection Modal -> `PeerJS Connection` -> `Companion Mode`.
-    -   Paste the ID of your main device into the "Companion's ID" field.
-    -   Click `Pair`.
-
-Now, your phone will automatically try to reconnect to your desktop whenever the plugin is active.
-
-> **💡 Pro Tip:** After connecting for the first time, it's a good idea to run a **Force Full Sync**. Click the `refresh-cw` ribbon icon and select the peer you want to sync with. This ensures both vaults are perfectly aligned.
+> **💡 Pro tip:** If two vaults ever look out of step, run a **Force Full Sync** — the `refresh-cw` ribbon icon, or the "Force full sync with a device" command — and pick the device to sync with.
 
 ## ⚙️ Configuration & Advanced Features
 
-All options are available in the plugin's settings tab (`Settings` -> `Obsidian Decentralized`). You may need to enable "Experimental Features" to see all options.
+All options live in the plugin's settings tab (`Settings` → `Obsidian Decentralized`). The **Mode** dropdown at the top controls how much is shown: `Auto` keeps things minimal with safe defaults, `Manual` exposes the common settings, and `Advanced` adds tuning and security options.
 
 ### Selective Sync
 
@@ -141,22 +122,31 @@ All options are available in the plugin's settings tab (`Settings` -> `Obsidian 
 
 When a file is changed on two devices before they have a chance to sync, a conflict occurs. Choose how you want to handle this:
 
--   **Create Conflict File (Default & Safest):** The incoming change is saved as a new file, e.g., `My Note (conflict on 2023-10-27).md`. You can then manually compare and merge them.
--   **Last Write Wins:** The version with the newest modification timestamp is kept, and the other is discarded.
--   **Attempt Auto-Merge:** For Markdown files, the plugin will try to merge the changes automatically. If it can't merge cleanly, it will fall back to creating a conflict file.
+-   **Create Conflict File (default and safest):** The incoming change is saved as a new file, e.g. `My Note (conflict on 2023-10-27).md`, so you can compare and merge them yourself.
+-   **Last Write Wins:** The version with the newest modification time is kept and the other is discarded.
+
+When exactly two devices are paired and two-device optimizations are on, the plugin instead resolves conflicts by role: the primary device's copy wins. This is automatic and overrides the setting above.
 
 ### Syncing Attachments and Config Files
 
 -   **Sync all file types:** By default, the plugin focuses on text files. Enable this to sync images, PDFs, audio, and other attachments.
 -   **Sync '.obsidian' configuration folder:** **(DANGEROUS)** Syncs your Obsidian settings, themes, and snippets. This can cause problems if your devices have different plugins, themes, or operating systems. **Always make a backup before enabling this.**
 
-### Experimental: Direct IP Mode
+### Offline Mode (no signaling server)
 
-For completely offline, LAN-only environments where even a signaling server is not desired.
+<a id="offline-mode-no-signaling-server"></a>
 
-1.  One device (usually a desktop) acts as the **Host**.
-2.  Other devices connect as **Clients**.
-3.  Use the `Connect` modal -> `Direct IP` to configure. The Host will display its IP address and a PIN for clients to use.
+For LAN-only environments with no internet, or where you don't want a signaling server involved at all. One device (usually a desktop) hosts and the others connect to it.
+
+**On the host (desktop only):**
+1.  Open the connection helper → **Advanced** tab → **Switch to Offline Mode**.
+2.  Press **Start Hosting**. The screen shows the host's IP address and a security token, with a button to copy the token.
+
+**On each other device:**
+1.  Open the connection helper → **Advanced** tab → **Switch to Offline Mode**.
+2.  Under **Join a Network**, enter the host's IP address and token, then connect. Hosts found on your Wi-Fi are also listed and can be selected directly.
+
+Unlike the default mode, Offline Mode authenticates the connection: the host rejects any client presenting the wrong token.
 
 ### Using a Custom Signaling Server
 
@@ -172,13 +162,15 @@ If a conflict occurs and a `(conflict)` file is created, a new icon (`swords`) w
 
 ## 🛡️ Security and Privacy
 
--   **End-to-End Encryption:** All data transferred between your devices is encrypted in-transit using DTLS (part of the WebRTC standard).
--   **No Cloud Storage:** Your notes are never stored on any third-party server. They are only ever on your devices.
--   **Signaling Server:** The only third-party interaction is with the signaling server, which is used solely to establish the initial P2P connection. It does not see or handle any of your note data. If you use the self-hosted option, you control this component as well.
+-   **No cloud storage.** Your notes are never stored on a third-party server. They exist only on your devices.
+-   **Transport encryption, always.** Every WebRTC connection is encrypted in transit with DTLS. This protects the data on the wire but says nothing about *who* is on the other end.
+-   **Application-layer encryption, when you pair with a key.** Pairing with the full copied code (or by QR) also exchanges a 256-bit AES-GCM key, and traffic on that link is encrypted with it on top of DTLS. Pairing by bare device ID does not exchange a key, so that link has no application-layer encryption. There is currently no indicator in the UI distinguishing the two — check that you pasted the copied code, not just the device ID.
+-   **The signaling server sees metadata, not notes.** In the default mode your devices register a stable ID with a public PeerJS server so they can find each other. It never handles note content, but it does see your device ID and IP address each session. Run your own PeerServer, or use Offline Mode, to avoid it entirely.
+-   **Know the limits.** By default, a device that knows your device ID can open a connection to you. The "strict security" setting under Advanced hardens this by refusing unrecognised and unencrypted peers; it is off by default because turning it on requires re-pairing existing devices. Offline Mode is token-authenticated regardless.
 
 ## ⚠️ Troubleshooting
 
--   **Plugin doesn't appear in Obsidian:** After manual installation, if the plugin doesn't show up under Community Plugins, double-check that the folder structure is correct: `<YourVault>/.obsidian/plugins/obsidian-decentralized/` and ensure this folder directly contains `main.js` and `manifest.json`.
+-   **Plugin doesn't appear in Obsidian:** Check the folder structure is `<YourVault>/.obsidian/plugins/obsidian-decentralized/` and that this folder directly contains `main.js`, `manifest.json`, and `styles.css`.
 -   **Connection Fails:**
     -   Ensure both devices are connected to the internet (for the default PeerJS mode).
     -   Check for firewalls or aggressive ad-blockers (like Pi-hole) that might be blocking the connection to the PeerJS signaling server or the P2P connection itself.
