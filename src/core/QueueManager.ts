@@ -10,6 +10,12 @@ export interface QueueItem {
     priority: number;
     /** Monotonic insertion counter, assigned internally to keep equal priorities FIFO. */
     seq?: number;
+    /**
+     * Set by the processor when a failure is transient and worth retrying. The processor
+     * swallows its own errors (it has cleanup to do in `finally`), so it cannot signal a
+     * retry by throwing; this flag is how it does so instead.
+     */
+    retryable?: boolean;
 }
 
 export class QueueManager {

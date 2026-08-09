@@ -1,7 +1,7 @@
 import { App, PluginSettingTab, Setting, setIcon, Notice } from 'obsidian';
 import type ObsidianDecentralizedPlugin from './main';
 import { PeerInfo, DEFAULT_SETTINGS, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE } from './types';
-import { ConnectionModal } from './ui';
+import { ConnectionModal, ConfirmModal } from './ui';
 
 export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
     plugin: ObsidianDecentralizedPlugin;
@@ -174,9 +174,11 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             new Setting(containerEl).setName("Secure (SSL)").addToggle(toggle => toggle.setValue(config.secure).onChange(async (value) => { config.secure = value; await this.plugin.saveSettings(); }));
 
             new Setting(containerEl)
-                .addButton(btn => btn.setButtonText("Apply and Reconnect").setWarning()
+                .setName("Apply signaling server changes")
+                .setDesc("Reconnects using the values above. Current connections drop while it reconnects.")
+                .addButton(btn => btn.setButtonText("Apply and reconnect").setWarning()
                     .onClick(() => {
-                        this.plugin.showNotice("Reconnecting to new PeerJS server...", 'info');
+                        this.plugin.showNotice("Reconnecting to the new signaling server…", 'important');
                         this.plugin.reinitializeConnectionManager();
                     }));
         }
@@ -255,12 +257,12 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                 }));
 
         new Setting(containerEl)
-            .setName("Require PIN for all connections")
-            .setDesc("If set, the join PIN is never cleared and must be provided by all incoming connections.")
+            .setName("Strict security")
+            .setDesc("Only accept devices this vault has an encryption key for, and reject unencrypted messages from them. Recommended, but devices paired by typing a bare device ID will need to be paired again using the full copied code or the QR.")
             .addToggle(toggle => toggle
-                .setValue(this.plugin.settings.requirePinForAllConnections)
+                .setValue(this.plugin.settings.strictSecurity)
                 .onChange(async (value) => {
-                    this.plugin.settings.requirePinForAllConnections = value;
+                    this.plugin.settings.strictSecurity = value;
                     await this.plugin.saveSettings();
                 }));
 
@@ -444,9 +446,16 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
             }
 
             if (type === 'companion') {
-                settingItem.addButton(btn => btn.setButtonText('Unpair').setWarning().onClick(async () => {
-                    await this.plugin.forgetCompanion();
-                    this.updateStatus();
+                settingItem.addButton(btn => btn.setButtonText('Unpair').setWarning().onClick(() => {
+                    new ConfirmModal(this.app, {
+                        title: 'Unpair this device?',
+                        body: `${peer.friendlyName} will no longer be your primary sync partner. You can pair again later.`,
+                        confirmText: 'Unpair',
+                        onConfirm: async () => {
+                            await this.plugin.forgetCompanion();
+                            this.updateStatus();
+                        },
+                    }).open();
                 }));
             }
             if (type === 'peer' || type === 'disconnected') {
@@ -473,9 +482,16 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                         setTimeout(() => this.updateStatus(), 100);
                     }));
                     settingItem.addExtraButton(btn => btn.setIcon('trash').setTooltip('Kick Device').onClick(() => {
-                        this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
-                        if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
-                        setTimeout(() => this.updateStatus(), 100);
+                        new ConfirmModal(this.app, {
+                            title: `Remove ${peer.friendlyName} from the group?`,
+                            body: 'Every device in the group stops syncing with it. It can rejoin by pairing again.',
+                            confirmText: 'Remove device',
+                            onConfirm: () => {
+                                this.plugin.broadcastData({ type: 'cluster-kick', targetDeviceId: peer.deviceId });
+                                if (this.plugin.connections.has(peer.deviceId)) this.plugin.connections.get(peer.deviceId)?.close();
+                                setTimeout(() => this.updateStatus(), 100);
+                            },
+                        }).open();
                     }));
                     settingItem.addExtraButton(btn => btn.setIcon('activity').setTooltip('Ping').onClick(() => {
                         this.plugin.manualPingStart.set(peer.deviceId, Date.now());
@@ -496,11 +512,23 @@ export class ObsidianDecentralizedSettingTab extends PluginSettingTab {
                     }));
                     if (type !== 'companion') {
                         settingItem.addButton(btn => btn.setButtonText('Forget').setWarning().onClick(() => {
-                            this.plugin.pendingConnections.delete(peer.deviceId);
-                            this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                            this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
-                            this.plugin.saveKnownPeers();
-                            setTimeout(() => this.updateStatus(), 100);
+                            new ConfirmModal(this.app, {
+                                title: `Forget ${peer.friendlyName}?`,
+                                body: 'This device is removed from your saved devices and its encryption key is deleted. You will need to pair again to sync with it.',
+                                confirmText: 'Forget device',
+                                onConfirm: () => {
+                                    this.plugin.pendingConnections.delete(peer.deviceId);
+                                    this.plugin.broadcastData({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
+                                    this.plugin.handleClusterForget({ type: 'cluster-forget', targetDeviceId: peer.deviceId });
+                                    // Forgetting a device must also drop its pre-shared key; leaving it
+                                    // behind meant a "forgotten" peer could still be auto-trusted later.
+                                    delete this.plugin.settings.peerKeys[peer.deviceId];
+                                    this.plugin.invalidateCryptoKey(peer.deviceId);
+                                    void this.plugin.saveSettings();
+                                    this.plugin.saveKnownPeers();
+                                    setTimeout(() => this.updateStatus(), 100);
+                                },
+                            }).open();
                         }));
                     }
                 }

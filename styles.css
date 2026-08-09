@@ -101,7 +101,7 @@ body.od-hide-native-sync .status-bar-item.plugin-sync {
 .od-status-banner { padding: 12px; border-radius: var(--radius-m); margin-bottom: 20px; text-align: center; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 8px; }
 .od-status-banner.idle { background: var(--background-primary-alt); border: 1px solid var(--background-modifier-border); color: var(--text-muted); }
 .od-status-banner.connecting { background: var(--background-modifier-hover); color: var(--text-normal); }
-.od-status-banner.reconnecting { background: rgba(255, 160, 0, 0.12); border: 1px solid rgba(255, 160, 0, 0.4); color: #c97d00; }
+.od-status-banner.reconnecting { background: var(--background-modifier-hover); border: 1px solid var(--background-modifier-border); color: var(--text-warning); }
 .od-status-banner.connected { background: var(--background-modifier-success); color: var(--text-success); border: 1px solid var(--background-modifier-success-hover); }
 .od-status-banner.error { background: var(--background-modifier-error); color: var(--text-error); border: 1px solid var(--background-modifier-error-hover); }
 
@@ -132,3 +132,37 @@ body.od-hide-native-sync .status-bar-item.plugin-sync {
 .od-mobile .od-full-width { width: 100%; margin-top: 10px; }
 .od-mobile .od-input-row { flex-direction: column; }
 .od-mobile .od-input-row button { width: 100%; margin-top: 5px; }
+
+/* Classes previously applied as inline styles from TypeScript. */
+.od-spaced-top { margin-top: 20px; }
+.od-token { font-size: 1.2em; word-break: break-all; }
+
+.od-conflict-badge {
+    position: absolute; top: 0; right: 0;
+    background: var(--text-error); color: var(--text-on-accent);
+    border-radius: 50%; padding: 1px 5px; font-size: 10px; font-weight: 600;
+    line-height: 1.4; pointer-events: none;
+}
+
+/* Conflict diff. These previously hardcoded pale GitHub-style pastels with no foreground
+   colour, which rendered as near-white text on near-white panels in Obsidian's default
+   dark theme — i.e. the conflict view was unreadable out of the box. */
+.obsidian-decentralized-diff-view {
+    font-family: var(--font-monospace); font-size: 0.9em;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 50vh; overflow-y: auto;
+    padding: 12px; border-radius: var(--radius-m);
+    background: var(--background-primary-alt);
+    border: 1px solid var(--background-modifier-border);
+}
+.obsidian-decentralized-diff-view .od-diff-insert {
+    background: var(--background-modifier-success); color: var(--text-normal);
+}
+.obsidian-decentralized-diff-view .od-diff-delete {
+    background: var(--background-modifier-error); color: var(--text-normal);
+    text-decoration: line-through;
+}
+
+.obsidian-decentralized-status-text { font-family: var(--font-monospace); margin-bottom: 1em; }
+.od-transfer-title { display: flex; align-items: center; margin-bottom: 4px; }
+.od-phase-label { font-weight: bold; margin-bottom: 8px; }

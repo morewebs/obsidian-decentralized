@@ -28,8 +28,20 @@ class MockWebSocketServer extends EventEmitter {
     constructor(options: any) {
         super();
         this.clients = new Set();
-        // Simulate immediate listen
-        setTimeout(() => this.emit('listening'), 0);
+    }
+
+    /**
+     * DirectIpServer.start() awaits a 'listening' event before it reports success. Tests run
+     * with fake timers, which also fake microtasks, so deferring the event by any means would
+     * require the test to advance the clock before the server could finish starting. Firing
+     * it the moment the handler is registered keeps the mock deterministic.
+     */
+    once(event: string | symbol, listener: (...args: any[]) => void): this {
+        if (event === 'listening') {
+            listener();
+            return this;
+        }
+        return super.once(event, listener);
     }
     
     close() {

@@ -25,6 +25,19 @@ export enum SyncPhase {
     ABORTING = 'ABORTING'
 }
 
+/** Phase text for the UI. The enum names leaked onto screen as "Phase: TRANSFERRING". */
+export function describeSyncPhase(phase: SyncPhase): string {
+    switch (phase) {
+        case SyncPhase.IDLE: return 'Idle';
+        case SyncPhase.REQUESTING: return 'Contacting the other device';
+        case SyncPhase.PLANNING: return 'Comparing vaults';
+        case SyncPhase.TRANSFERRING: return 'Transferring files';
+        case SyncPhase.COMPLETING: return 'Finishing up';
+        case SyncPhase.ABORTING: return 'Stopping';
+        default: return 'Syncing';
+    }
+}
+
 export enum SyncErrorCategory {
     CONNECTION_ERROR = 'CONNECTION_ERROR',
     TIMEOUT_ERROR = 'TIMEOUT_ERROR',
@@ -498,7 +511,12 @@ export interface ObsidianDecentralizedSettings {
     debounceDelay: number;
     mtimeTolerance: number;
     knownPeers: PeerInfo[];
-    requirePinForAllConnections: boolean;
+    /**
+     * Refuse peers we have no encryption key for, and refuse unencrypted messages from peers
+     * we do. Off by default because enabling it means re-pairing any device that was paired
+     * without a key.
+     */
+    strictSecurity: boolean;
     idleTimeoutMs: number;
     tombstoneRetentionDays: number;
     enableCompression: boolean;
@@ -540,7 +558,7 @@ export const DEFAULT_SETTINGS: ObsidianDecentralizedSettings = {
     debounceDelay: 2000,
     mtimeTolerance: 1500,
     knownPeers: [],
-    requirePinForAllConnections: false,
+    strictSecurity: false,
     idleTimeoutMs: 30000,
     tombstoneRetentionDays: 30,
     enableCompression: true,

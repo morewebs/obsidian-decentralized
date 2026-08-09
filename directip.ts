@@ -53,27 +53,63 @@ export class DirectIpServer {
     private clients: Map<string, ServerClientEntry> = new Map();
     private pin: string;
     private reapInterval: number | null = null;
+    /**
+     * Resolves once the socket is actually bound, rejects if it never binds. Callers must
+     * await this before telling the user that hosting is active — `new WebSocketServer()`
+     * does not throw on EADDRINUSE, the failure arrives asynchronously.
+     */
+    public readonly listening: Promise<void>;
 
     constructor(private plugin: ObsidianDecentralizedPlugin, port: number, pin: string) {
         this.pin = pin;
         if (Platform.isMobile) {
             this.plugin.showNotice("Offline Host mode is only available on Desktop.", 'important');
-            return;
+            this.listening = Promise.reject(new Error("Offline Host mode is only available on Desktop."));
+        } else {
+            this.listening = this.start(port);
         }
-        this.start(port);
+        // The caller owns the real error reporting; this only stops Node/Electron from
+        // flagging an unhandled rejection when nobody happens to be awaiting yet.
+        this.listening.catch(() => { /* reported by the caller */ });
     }
 
-    private start(port: number) {
+    private async start(port: number): Promise<void> {
+        let WebSocketServer: any;
         try {
-            const { WebSocketServer } = require('ws');
-            this.wss = new WebSocketServer({ port });
+            // A bare require('ws') is invisible to rollup and survives into the bundle
+            // unresolved, so it throws MODULE_NOT_FOUND in any install without node_modules.
+            // A dynamic import is statically analysable (and inlined by inlineDynamicImports)
+            // while still deferring evaluation, so mobile never loads it.
+            ({ WebSocketServer } = await import('ws'));
         } catch (err: any) {
-            this.plugin.log("Failed to load/initialize 'ws' module:", err);
-            this.plugin.showNotice(`Failed to start Offline Host server: ${err.message || err}`, 'error');
-            this.wss = null;
-            return;
+            this.plugin.log("Failed to load the 'ws' module:", err);
+            throw new Error(`Could not load the WebSocket server module: ${err?.message || err}`);
         }
-        
+
+        await new Promise<void>((resolve, reject) => {
+            let settled = false;
+            try {
+                this.wss = new WebSocketServer({ port });
+            } catch (err: any) {
+                reject(new Error(`Could not start the offline host on port ${port}: ${err?.message || err}`));
+                return;
+            }
+            this.wss.once('listening', () => {
+                settled = true;
+                resolve();
+            });
+            this.wss.once('error', (err: any) => {
+                if (settled) return;
+                settled = true;
+                const reason = err?.code === 'EADDRINUSE'
+                    ? `port ${port} is already in use — another vault or app may be hosting already`
+                    : (err?.message || String(err));
+                try { this.wss?.close(); } catch (_) { /* ignore */ }
+                this.wss = null;
+                reject(new Error(`Could not start the offline host: ${reason}`));
+            });
+        });
+
         this.wss.on('connection', (socket: any, request: any) => {
             const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
             const pin = url.searchParams.get('pin');
@@ -250,6 +286,11 @@ export class DirectIpServer {
             this.wss.close();
         }
         this.wss = null;
+        // Drop the plugin's reference too, otherwise calculateStatus keeps reporting a live
+        // host after the socket is gone (a dead server still read as "hosting" in the UI).
+        if (this.plugin.directIpServer === this) {
+            this.plugin.directIpServer = null;
+        }
         this.plugin.log("Offline Server stopped.");
     }
 }

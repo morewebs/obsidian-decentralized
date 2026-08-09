@@ -93,7 +93,9 @@ import {
     splitBinaryPayload,
     joinBinaryPayload,
     packFrame,
-    unpackFrame
+    unpackFrame,
+    sanitizeVaultPath,
+    taskQueueId
 } from './utils';
 
 import { TimeoutManager } from './src/utils/Timeouts';
@@ -171,7 +173,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private lastRenderedStatus: SyncStatusState | null = null;
     private conflictCenter: ConflictCenter;
     public activeTransfers: Map<string, TransferStatus> = new Map();
-    public joinPin: string | null = null;
+    /**
+     * When the current pairing key stops being accepted for auto-enrolment. Without a
+     * deadline the window stayed open for the whole session, so anyone who had seen the QR
+     * code could pair at any later point.
+     */
+    public activePskExpiresAt: number = 0;
+    /** How long a displayed pairing code stays valid for auto-enrolment. */
+    public static readonly PAIRING_WINDOW_MS = 10 * 60 * 1000;
+
+    /** The pairing key, but only while the pairing window is still open. */
+    public getActivePsk(): string | null {
+        if (!this.activePsk || Date.now() >= this.activePskExpiresAt) return null;
+        return this.activePsk;
+    }
+
+    /** Opens (or re-opens) the pairing window, generating a key if there isn't one yet. */
+    public async beginPairingWindow(): Promise<string> {
+        if (!this.activePsk) this.activePsk = await this.generatePSK();
+        this.activePskExpiresAt = Date.now() + ObsidianDecentralizedPlugin.PAIRING_WINDOW_MS;
+        return this.activePsk;
+    }
     public activePsk: string | null = null;
     private clusterConnectionInterval: number | null = null;
     public pendingConnections: Set<string> = new Set();
@@ -270,10 +292,15 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.timeoutManager = new TimeoutManager();
         this.connectionManager = new ConnectionManager(this.timeoutManager);
         this.queueManager = new QueueManager(this.timeoutManager, async (item) => {
+            // processQueueItem never throws — it catches everything so its `finally` can
+            // release acks and record batch completion — so it reports a retryable failure
+            // by setting item.retryable instead.
+            item.retryable = false;
             try {
                 await this.processQueueItem(item);
-                return true;
+                return !item.retryable;
             } catch (e) {
+                console.error("Unexpected error processing queue item", e);
                 return false;
             }
         });
@@ -301,8 +328,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.conflictCenter.registerRibbon();
         this.addRibbonIcon('users', 'Connect to a Peer', () => new ConnectionModal(this.app, this).open());
         this.addRibbonIcon('refresh-cw', 'Force Full Sync with Peer', () => {
-            if (this.connections.size === 0) { this.showNotice("No peers connected.", 'info'); return; }
+            if (this.connections.size === 0) { this.showNotice("No peers connected.", 'important'); return; }
             new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
+        });
+
+        // Mirror the ribbon actions as commands. Without these nothing the plugin does can be
+        // reached from the command palette or bound to a hotkey.
+        this.addCommand({
+            id: 'open-connect-modal',
+            name: 'Connect to a device',
+            callback: () => new ConnectionModal(this.app, this).open(),
+        });
+        this.addCommand({
+            id: 'force-full-sync',
+            name: 'Force full sync with a device',
+            checkCallback: (checking: boolean) => {
+                if (this.connections.size === 0) return false;
+                if (!checking) {
+                    new SelectPeerModal(this.app, this.connections, this.clusterPeers, (peerId: string) => this.requestFullSyncFromPeer(peerId)).open();
+                }
+                return true;
+            },
+        });
+        this.addCommand({
+            id: 'show-sync-progress',
+            name: 'Show sync progress',
+            callback: () => new SyncProgressModal(this.app, this).open(),
+        });
+        this.addCommand({
+            id: 'resolve-conflicts',
+            name: 'Resolve sync conflicts',
+            callback: () => this.conflictCenter.showConflictList(),
         });
 
         // Any vault mutation — local or applied from a peer — makes the cached Merkle
@@ -350,13 +406,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             this.networkChangeHandler = null;
         }
 
+        // These three are plain window timers, not registerInterval/timeoutManager ones, so
+        // nothing clears them for us. Left running, a disabled instance keeps calling
+        // initializePeer() and races the next load for the same PeerJS id — which the broker
+        // answers with unavailable-id, and only an Obsidian restart recovers from.
+        if (this.peerInitRetryTimeout) { clearTimeout(this.peerInitRetryTimeout); this.peerInitRetryTimeout = null; }
+        if (this.peerReconnectFallbackTimeout) { clearTimeout(this.peerReconnectFallbackTimeout); this.peerReconnectFallbackTimeout = null; }
+        if (this.clusterConnectionInterval) { clearInterval(this.clusterConnectionInterval); this.clusterConnectionInterval = null; }
+
         this.peer?.destroy();
         this.lanDiscovery.stop();
         this.directIpServer?.stop();
         this.directIpClient?.stop();
 
         this.activeTransfers.clear();
-        this.connections.clear(); 
+        this.connections.clear();
         
         // Safely destroy all background timeouts and queue processes
         this.queueManager.clear();
@@ -737,19 +801,22 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     public showNotice(message: string, level: 'info' | 'verbose' | 'error' | 'important' | 'warning' = 'info', timeout?: number) {
-        if (!this.settings.showToasts) {
-            return;
-        }
+        // Errors, warnings and connection/conflict events always surface, regardless of
+        // showToasts — that is what the setting's own description promises, and gating them
+        // left a fresh install completely mute (including failures the user must act on).
         if (level === 'error') {
-            new Notice(`[Error] ${message}`, timeout || 10000);
+            new Notice(message, timeout || 10000);
             return;
         }
         if (level === 'warning') {
-            new Notice(`[Warning] ${message}`, timeout || 8000);
+            new Notice(message, timeout || 8000);
             return;
         }
         if (level === 'important') {
             new Notice(message, timeout);
+            return;
+        }
+        if (!this.settings.showToasts) {
             return;
         }
         if (level === 'verbose' && !this.settings.verboseLogging) {
@@ -778,11 +845,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     private generateTransferId(path: string): string { return `${path}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`; }
     
     // --- File System Events ---
-    private handleEvent(file: TAbstractFile) { 
-        if (this.shouldIgnoreEvent(file.path)) return; 
-        if (!this.isPathSyncable(file.path)) return; 
-        if (!this.hasPeers()) return; 
-        
+    private handleEvent(file: TAbstractFile) {
+        if (this.shouldIgnoreEvent(file.path)) return;
+        if (!this.isPathSyncable(file.path)) return;
+
+        // Record local state even with no peer connected. This used to return here first, so
+        // an edit or delete made while offline left no trace: no hash invalidation, no version
+        // bump, and — because the tombstone is written inside handleFileDelete — no record of
+        // the deletion at all. On the next connection the stale hash made the vaults look
+        // identical, and peers resurrected files that had been deleted offline.
+        if (!this.hasPeers()) {
+            if (!this.app.vault.getAbstractFileByPath(file.path)) {
+                this.syncedHashes.delete(file.path);
+                if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
+                this.tombstones[file.path] = Date.now();
+            } else {
+                this.syncedHashes.delete(file.path);
+                if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
+                this.clearTombstone(file.path);
+            }
+            this.scheduleStateSave();
+            return;
+        }
+
         if (this.isTwoDeviceMode() && this.remoteLocks.has(file.path)) {
             const lock = this.remoteLocks.get(file.path)!;
             if (Date.now() < lock.expiresAt) {
@@ -832,11 +917,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 await this.requestLock(file.path);
             }
 
-            if (file instanceof TFile) { 
+            if (file instanceof TFile) {
                 if (this.isTwoDeviceMode()) this.incrementVersion(file.path);
                 this.syncedHashes.delete(file.path);
-                await this.sendFileUpdate(file); 
-            } else if (file instanceof TFolder) { 
+                // Recreating a deleted file must retract our deletion record, or the next
+                // manifest still advertises it as deleted and peers remove their copy.
+                this.clearTombstone(file.path);
+                await this.sendFileUpdate(file);
+            } else if (file instanceof TFolder) {
                 this.addToQueueTask(null, { taskType: 'send-folder-create', path: file.path });
             } 
         }); 
@@ -1050,10 +1138,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
      * distinct chunk or transfer) and must not be collapsed.
      */
     private taskQueueId(peerId: string | null, task: SyncTask): string {
-        const target = task.taskType === 'send-rename'
-            ? `${task.oldPath} ${task.newPath}`
-            : (task.taskType === 'send-file-batch' ? task.batchId : task.path);
-        return `${peerId || '*'} ${task.taskType} ${target}`;
+        return taskQueueId(peerId, task);
     }
 
     /**
@@ -1189,6 +1274,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.syncState.pendingPulls.clear();
         this.syncState.allowedPulls.clear();
         this.syncState.activeBatches.clear();
+        // These two were left populated across an abort, so the next sync's batch-complete
+        // messages were matched against stale ids and its in-flight bookkeeping never settled.
+        this.syncState.activePullBatches?.clear();
+        this.syncState.inFlightPulls?.clear();
         this.localSyncComplete.clear();
         this.peerSyncComplete.clear();
         this.pullRetries.clear();
@@ -1305,7 +1394,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         this.queueManager.resume();
     }
 
-    private async processQueueItem(item: { peerId: string | null, task?: SyncTask, data?: any, retries: number, priority: number }) {
+    private async processQueueItem(item: { peerId: string | null, task?: SyncTask, data?: any, retries: number, priority: number, retryable?: boolean }) {
         let transferId: string | undefined;
         let isPaused = false;
         let success = false;
@@ -1382,11 +1471,20 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             item.data = { type: 'file-update', path: file.path, content, mtime: file.stat.mtime, encoding, transferId: this.generateTransferId(file.path), fileHash: hash, compressed: isCompressedText, versionVector: vv };
                         }
                     } else {
-                        success = true;
+                        // The file is gone locally, so nothing was delivered. Reporting success
+                        // put the path in the batch's receivedPaths, and the peer then dropped
+                        // it from its pending pulls — the sync claimed to be complete with the
+                        // file missing on both sides.
+                        this.log(`Cannot send ${task.path}: no longer present in the vault.`);
                         return;
                     }
                 } else if (task.taskType === 'send-delete') {
-                    item.data = { type: 'file-delete', path: task.path, transferId: this.generateTransferId(task.path) };
+                    // The vector has to travel with the delete: handleFileDelete bumps it just
+                    // before queueing this task, but it was never put on the wire, so the
+                    // receiver's edit-versus-delete branch could never run and every remote
+                    // delete applied unconditionally — destroying concurrent local edits.
+                    let vv = this.isTwoDeviceMode() ? this.twoDeviceState.fileVersions[task.path] : undefined;
+                    item.data = { type: 'file-delete', path: task.path, transferId: this.generateTransferId(task.path), versionVector: vv };
                 } else if (task.taskType === 'send-folder-create') {
                     item.data = { type: 'folder-create', path: task.path, transferId: this.generateTransferId(task.path) };
                 } else if (task.taskType === 'send-rename') {
@@ -1430,14 +1528,23 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                             data: packFilesToTLV(packedFiles)
                         };
                     } else {
-                        success = true;
+                        // Not one file in the batch could be read, so nothing goes out. Same
+                        // reasoning as above: report the failure so the paths are re-authorized
+                        // for another attempt instead of being marked delivered.
+                        this.log(`Batch ${task.batchId} packed no files; reporting it as failed.`);
                         return;
                     }
                 }
             }
             
             const data = item.data;
-            if (!data) return;
+            if (!data) {
+                // item.data is nulled once a send completes or fails permanently, so reaching
+                // here means the item was re-entered with nothing left to send. Not retryable;
+                // the `finally` below reports it to the batch so it does not hang.
+                this.log(`Queue item for ${item.peerId || 'broadcast'} has no payload; treating as failed.`);
+                return;
+            }
             transferId = data.transferId;
 
             if (!peerId && (data.type === 'file-update' || data.type === 'file-delta')) {
@@ -1595,6 +1702,8 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             if (e instanceof Error && e.message.includes('IntegrityError')) {
                 this.log(`Integrity failure for transfer ${transferId}.`);
                 if (item.data && item.data.type === 'file-delta') {
+                    // A full resend has been queued in place of the bad delta, so this item
+                    // is finished — retrying it would send the same broken delta again.
                     const file = this.app.vault.getAbstractFileByPath(item.data.path);
                     if (file instanceof TFile) {
                         this.sendFileUpdate(file, item.peerId || undefined, true);
@@ -1602,9 +1711,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     return;
                 } else {
                     this.log(`Re-queueing.`);
+                    item.retryable = true;
                 }
             } else {
                 console.error(`Error processing queue item ${transferId}:`, e);
+                item.retryable = true;
             }
             
             // QueueManager handles the retry backoff safely now.
@@ -1640,7 +1751,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             let isFinal = false;
             if (success) {
                 isFinal = true;
-            } else if (!isPaused && (!item || item.retries >= 3)) {
+            } else if (!isPaused && (!item || !item.retryable || item.retries >= 3)) {
+                // Either nothing will retry this, or the retries are exhausted. Either way it
+                // is the last word on the item, so the batch has to hear about the failure now
+                // — otherwise sentCount never reaches totalCount and the peer waits out the
+                // full BATCH_TIMEOUT.
                 isFinal = true;
             }
 
@@ -1842,17 +1957,27 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             return;
         }
 
+        // A flaky network produces socket-error/webrtc errors constantly. Tearing every live
+        // connection down over one of them turns a blip into a full reconnect cycle, so only
+        // errors that actually invalidate the peer object get the full teardown.
+        const isFatal = err.type !== 'socket-error' && err.type !== 'webrtc';
+        if (!isFatal) {
+            this.log(`Transient PeerJS error (${err.type}); keeping existing connections.`);
+            return;
+        }
+
         this.peer?.destroy();
         this.peer = null;
         this.connections.forEach(conn => conn.close());
         this.connections.clear();
         this.activeTransfers.clear();
-    
+
         let userMessage = 'Connection Failed';
         switch(err.type) {
             case 'network': userMessage = 'Network Error. Check internet connection.'; break;
             case 'server-error': userMessage = 'Server Error. Try again later.'; break;
             case 'disconnected': userMessage = 'Disconnected from server.'; break;
+            case 'unavailable-id': userMessage = 'This device ID is already in use. If you just reloaded the plugin, wait a moment; if you cloned a vault, generate a new device ID in settings.'; break;
         }
         this.updateStatus({ text: `Error: ${userMessage}`, icon: 'alert-triangle', state: 'error' });
     
@@ -1882,8 +2007,13 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     const encrypted = await this.encryptPayload(payload, conn.peer);
                     conn.send(encrypted);
                 } catch(e) {
-                    this.log("Failed to encrypt handshake", e);
-                    conn.send(payload);
+                    // Do NOT fall back to sending this in the clear. We hold a key for this
+                    // peer, so a plaintext handshake is exactly the downgrade the receive-side
+                    // gate now rejects, and it contradicts encryptPayload's own contract.
+                    this.log("Failed to encrypt handshake; closing connection instead of sending it in the clear", e);
+                    this.showNotice('Could not encrypt the connection to a paired device. Try re-pairing it.', 'error');
+                    conn.close();
+                    return;
                 }
             } else {
                 conn.send(payload);
@@ -1914,6 +2044,10 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             for (const [id, transfer] of this.activeTransfers.entries()) {
                 if (transfer.peerId === peerId && transfer.direction === 'download') {
                     this.activeTransfers.delete(id);
+                    // Release the preallocated reassembly buffer too. These were only ever
+                    // reclaimed by the five-minute sweeper, so a peer that connected and
+                    // dropped repeatedly could pin gigabytes of memory.
+                    this.pendingFileChunks.delete(id);
                 }
             }
             this.updateStatus();
@@ -1947,6 +2081,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     async handleRawIncomingData(raw: any, conn: DataConnection) {
         let data = raw;
+        let wasEncrypted = false;
 
         // A 2.x peer sends the old base64-in-JSON envelope. It is unreadable here and
         // the version gate in handleHandshake cannot fire (the handshake itself may be
@@ -1968,10 +2103,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     this.log("Decryption failed, ignoring message", e);
                     return;
                 }
-            } else if (this.activePsk) {
+            } else if (this.getActivePsk()) {
                 // A peer pairing via the active QR code has no stored key yet. Adopt the
                 // active PSK provisionally, and roll it back if it does not decrypt.
-                this.settings.peerKeys[conn.peer] = this.activePsk;
+                // getActivePsk() returns null once the pairing window has closed.
+                this.settings.peerKeys[conn.peer] = this.getActivePsk()!;
                 this.invalidateCryptoKey(conn.peer);
                 try {
                     data = await this.decryptPayload(raw, conn.peer);
@@ -1987,7 +2123,26 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 this.log("Received encrypted message but no PSK found for peer", conn.peer);
                 return;
             }
+            wasEncrypted = true;
         }
+
+        // Encryption used to be opportunistic on receive: anything that simply wasn't an
+        // encrypted-frame fell through and was processed as trusted, so a peer could skip the
+        // envelope entirely rather than needing the key. Reject plaintext from any peer we
+        // hold a key for.
+        if (!wasEncrypted && this.settings.peerKeys[conn.peer]) {
+            this.log(`Refusing unencrypted message from ${conn.peer}, which has an encryption key.`);
+            this.showNotice('Refused an unencrypted message from a paired device. If this repeats, re-pair the devices.', 'warning');
+            return;
+        }
+
+        // Under strict security the handshake is the only thing allowed before a key exists;
+        // everything else from an unknown peer is dropped.
+        if (this.settings.strictSecurity && !wasEncrypted && raw?.type !== 'handshake') {
+            this.log(`Strict security: dropping ${raw?.type} from unauthenticated peer ${conn.peer}.`);
+            return;
+        }
+
         this.processIncomingData(data, conn);
     }
     
@@ -2186,7 +2341,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         }
                     });
                     break;
-                case 'file-delete': this.applyFileDelete(data); break;
+                case 'file-delete':
+                    // Unlike file-update and file-delta this had no error handling at all, so
+                    // a failed delete surfaced only as an unhandled rejection.
+                    this.applyFileDelete(data).catch(e => {
+                        this.log(`Failed to apply remote delete for ${data.path}`, e);
+                        this.showNotice(`Could not delete ${data.path} — it may still exist on this device.`, 'error');
+                    });
+                    break;
                 case 'file-rename': this.applyFileRename(data); break;
                 case 'folder-create': this.applyFolderCreate(data); break;
                 case 'folder-delete': this.applyFolderDelete(data); break;
@@ -2194,6 +2356,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 
                 // Pull-based Sync
                 case 'request-full-sync': await this.handleFullSyncRequest(data, conn!); break;
+                case 'sync-busy':
+                    this.showNotice('The other device is already syncing. Try again in a moment.', 'important');
+                    if (this.syncState.isSyncing) {
+                        this.abortSync(new SyncError(SyncErrorCategory.CONNECTION_ERROR, 'The other device is already syncing.', true, 'Wait for it to finish, then try again.'));
+                    }
+                    break;
                 case 'sync-plan': await this.handleSyncPlan(data, conn!); break;
                 case 'request-batch': await this.handleRequestBatch(data, conn!); break;
                 case 'batch-complete': this.handleBatchComplete(data, conn!); break;
@@ -2258,14 +2426,21 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             conn.close();
             return;
         }
-        if (this.joinPin && data.pin !== this.joinPin) {
-            this.showNotice(`Incorrect PIN from ${data.peerInfo.friendlyName}. Connection rejected.`, 'error', 10000); 
-            conn.close(); 
-            return; 
+        // Strict security: only peers we already share a key with, or one arriving during an
+        // open pairing window, may connect. Off by default because it locks out devices that
+        // were paired by bare device ID. (This replaces a PIN gate that could never fire:
+        // joinPin was only ever null, so both of its branches were unreachable.)
+        if (this.settings.strictSecurity
+            && !this.settings.peerKeys[conn.peer]
+            && !this.getActivePsk()) {
+            this.showNotice(
+                `Refused a connection from ${data.peerInfo?.friendlyName || 'an unknown device'}: it is not paired with this vault. Open the Connect screen on both devices to pair.`,
+                'warning', 10000
+            );
+            this.log(`Strict security: rejecting unpaired peer ${conn.peer}`);
+            conn.close();
+            return;
         }
-        if (this.joinPin && !this.settings.requirePinForAllConnections) { 
-            this.joinPin = null; 
-        } 
         this.showNotice(`Connected to ${data.peerInfo.friendlyName}`, 'important', 4000);
         this.lastHeard.set(conn.peer, Date.now());
         this.connections.set(conn.peer, conn); this.clusterPeers.set(conn.peer, data.peerInfo); this.updateStatus();
@@ -2745,20 +2920,42 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleFileChunkStart(payload: FileChunkStartPayload, conn: DataConnection | null) {
-        // Guard: reject transfer if claimed total size exceeds the 512 MB reassembly cap
+        // Everything here is peer-supplied and drives a preallocation, so validate before
+        // allocating anything.
         const MAX_REASSEMBLY_SIZE = 512 * 1024 * 1024;
-        if (payload.totalChunks > MAX_REASSEMBLY_SIZE / MAX_CHUNK_SIZE) {
-            this.log(`Rejecting chunked transfer for ${payload.path}: totalChunks (${payload.totalChunks}) would exceed max reassembly size.`);
+        /** Concurrent inbound reassemblies. Each one holds a fully preallocated buffer. */
+        const MAX_CONCURRENT_REASSEMBLIES = 16;
+
+        if (!this.isPathSyncable(payload.path)) {
+            this.log(`Rejecting chunked transfer for an out-of-scope path: ${payload.path}`);
+            return;
+        }
+
+        const totalChunks = payload.totalChunks;
+        // Integer check first: NaN and negatives both compare false against the ceiling
+        // below, so a bare `> max` test let them straight through.
+        if (!Number.isSafeInteger(totalChunks) || totalChunks <= 0 || totalChunks > MAX_REASSEMBLY_SIZE / MAX_CHUNK_SIZE) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: invalid totalChunks (${totalChunks}).`);
             return;
         }
         const totalBytes = payload.totalBytes;
         const chunkSize = payload.chunkSize;
-        if (!Number.isFinite(totalBytes) || totalBytes < 0 || totalBytes > MAX_REASSEMBLY_SIZE) {
+        if (!Number.isSafeInteger(totalBytes) || totalBytes < 0 || totalBytes > MAX_REASSEMBLY_SIZE) {
             this.log(`Rejecting chunked transfer for ${payload.path}: invalid totalBytes (${totalBytes}).`);
             return;
         }
-        if (!Number.isFinite(chunkSize) || chunkSize <= 0 || chunkSize > MAX_CHUNK_SIZE) {
+        if (!Number.isSafeInteger(chunkSize) || chunkSize <= 0 || chunkSize > MAX_CHUNK_SIZE) {
             this.log(`Rejecting chunked transfer for ${payload.path}: invalid chunkSize (${chunkSize}).`);
+            return;
+        }
+        // The three must agree. Without this a peer could claim 512 MB in a single chunk and
+        // force the whole allocation with one small message.
+        if (totalChunks !== Math.max(1, Math.ceil(totalBytes / chunkSize))) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: totalChunks (${totalChunks}) does not match totalBytes/chunkSize.`);
+            return;
+        }
+        if (!this.pendingFileChunks.has(payload.transferId) && this.pendingFileChunks.size >= MAX_CONCURRENT_REASSEMBLIES) {
+            this.log(`Rejecting chunked transfer for ${payload.path}: too many concurrent transfers in progress.`);
             return;
         }
 
@@ -2903,6 +3100,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async applyFileDelta(data: FileDeltaPayload) {
+        // Deltas reached the vault without ever consulting the folder filters or the path
+        // guard, unlike every other apply* path.
+        if (!this.isPathSyncable(data.path)) return;
         await this.runLocked(data.path, async () => {
             const existingFile = this.app.vault.getAbstractFileByPath(data.path);
             if (!(existingFile instanceof TFile)) {
@@ -2989,6 +3189,9 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
 
     private async handleNewFileCreation(data: FileUpdatePayload) {
         this.log(`Creating new file: ${data.path}`);
+        // The path exists again, so any deletion record for it is stale. Left in place it
+        // would keep being advertised in our manifest and make peers delete their copy.
+        this.clearTombstone(data.path);
         this.ignoreNextEventForPath(data.path);
         try {
             const folderPath = data.path.substring(0, data.path.lastIndexOf('/'));
@@ -3228,29 +3431,29 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                     contentStr = ObsidianDecentralizedPlugin.textDecoder.decode(fileData.content);
                 }
 
-                await this.runLocked(fileData.path, async () => {
-                    const existingFile = this.app.vault.getAbstractFileByPath(fileData.path);
-                    if (existingFile instanceof TFile) {
-                        this.ignoreNextEventForPath(fileData.path);
-                        if (contentBuf) {
-                            await this.app.vault.modifyBinary(existingFile, contentBuf);
-                        } else {
-                            await this.app.vault.modify(existingFile, contentStr);
-                        }
-                    } else {
-                        const slash = fileData.path.lastIndexOf('/');
-                        if (slash > 0) await this.ensureFolderExists(fileData.path.substring(0, slash));
-                        this.ignoreNextEventForPath(fileData.path);
-                        if (contentBuf) {
-                            await this.app.vault.createBinary(fileData.path, contentBuf);
-                        } else {
-                            await this.app.vault.create(fileData.path, contentStr);
-                        }
-                    }
-                    this.syncState.filesTransferred++;
-                    this.syncState.bytesTransferred += fileData.content.byteLength;
-                });
+                // Delegate to the normal single-file receive path rather than writing here.
+                // This inline write skipped the path guard, the folder filters, the
+                // existing-is-a-folder check, conflict resolution, mtime preservation and the
+                // hash-cache update — so a batch could silently overwrite a locally edited
+                // note, and every batch-received file was re-transferred on the next sync
+                // because neither its mtime nor its hash was ever recorded.
+                //
+                // Note: applyFileUpdate takes its own runLocked on the same path, so this must
+                // NOT be wrapped in one — runLocked chains per path and would deadlock.
+                await this.applyFileUpdate({
+                    type: 'file-update',
+                    path: fileData.path,
+                    content: contentBuf ?? contentStr,
+                    mtime: fileData.mtime,
+                    encoding: contentBuf ? 'binary' : 'utf8',
+                    transferId: this.generateTransferId(fileData.path),
+                    // Already decompressed above; the TLV format carries no hash or version
+                    // vector, so conflict resolution falls back to mtime comparison.
+                    compressed: false,
+                } as FileUpdatePayload);
 
+                // Progress is counted once, in handleBatchComplete, which is authoritative for
+                // the batch. Counting here too made the UI report up to twice filesTotal.
                 return fileData.path;
             } catch (e) {
                 this.log(`Failed to write batched file ${fileData.path}`, e);
@@ -3270,7 +3473,11 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     async createConflictFile(data: FileUpdatePayload) {
+        // getConflictPath is string surgery on a peer-supplied path, so validate before it
+        // is used to create anything.
+        if (!this.isPathSyncable(data.path)) return;
         const conflictPath = this.getConflictPath(data.path);
+        if (!sanitizeVaultPath(conflictPath)) return;
         this.ignoreNextEventForPath(conflictPath);
         const folderPath = conflictPath.substring(0, conflictPath.lastIndexOf('/'));
         if (folderPath) await this.ensureFolderExists(folderPath);
@@ -3530,7 +3737,12 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                         // conflict resolution (version vectors / role-based) then picks the
                         // same winner deterministically. Pushing only our copy left the peer
                         // stale whenever its version-vector dominated ours.
-                        this.sendFileUpdate(file, conn.peer);
+                        //
+                        // forceFull is required: buildMerkleTree caches every file's content
+                        // hash in syncedHashes, and that cache is global rather than per-peer,
+                        // so the echo guard in processQueueItem would drop every reconciliation
+                        // send as a self-echo.
+                        this.sendFileUpdate(file, conn.peer, true);
                         if (remoteHash) {
                             this.sendData(conn.peer, { type: 'request-file', path: fullPath });
                         }
@@ -3540,11 +3752,14 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
     }
 
-    async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) { 
-        if (this.syncState.isSyncing) { 
-            this.log(`Received a sync request from ${conn.peer}, but a sync is already in progress in phase ${this.syncState.currentPhase}. Ignoring.`); 
-            return; 
-        } 
+    async handleFullSyncRequest(data: FullSyncRequestPayload, conn: DataConnection) {
+        if (this.syncState.isSyncing) {
+            this.log(`Received a sync request from ${conn.peer}, but a sync is already in progress in phase ${this.syncState.currentPhase}. Declining.`);
+            // Say so rather than going quiet. If both devices start a sync at the same moment
+            // each was left waiting on the other until the 120 s planning timeout fired.
+            try { conn.send({ type: 'sync-busy' }); } catch (_) { /* peer already gone */ }
+            return;
+        }
         try {
             if (!data.manifest) throw new SyncError(SyncErrorCategory.PROTOCOL_ERROR, "Received invalid sync request (missing manifest).", false, "Update plugin on both devices.");
             this.showNotice(`Peer ${this.clusterPeers.get(conn.peer)?.friendlyName} requested a full sync. Comparing vaults...`, 'info'); 
@@ -4086,9 +4301,17 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
     }
 
     handleRequestFile(data: RequestFilePayload, conn: DataConnection) {
+        // Without this a peer could request any path at all — including
+        // .obsidian/plugins/*/data.json, which holds other plugins' credentials.
+        if (!this.isPathSyncable(data.path)) {
+            this.log(`Peer ${conn.peer} requested a path outside the sync scope: ${data.path}`);
+            return;
+        }
         const file = this.app.vault.getAbstractFileByPath(data.path);
         if (file instanceof TFile) {
-            this.sendFileUpdate(file, conn.peer);
+            // A peer asked for this file explicitly, so it must never be echo-suppressed:
+            // syncedHashes reflects our own content, not what the peer already holds.
+            this.sendFileUpdate(file, conn.peer, true);
         }
     }
     
@@ -4120,13 +4343,37 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 }
             }
         }
+        // Only advertise a deletion for paths that are actually gone. The peer indexes this
+        // manifest by path and keeps the LAST entry per path, so a stale tombstone for a file
+        // that has since been recreated overwrote its live entry — and the peer then deleted
+        // its own copy outright.
+        const livePaths = new Set(manifest.map(entry => entry.path));
         for (const [path, timestamp] of Object.entries(this.tombstones)) {
+            if (livePaths.has(path)) continue;
             manifest.push({ type: 'deleted', path, mtime: timestamp, size: 0 });
         }
-        return manifest; 
+        return manifest;
     }
 
-    private isPathSyncable(path: string): boolean {
+    /** Forget a deletion record, because the path exists again. */
+    public clearTombstone(path: string) {
+        if (this.tombstones[path] === undefined) return;
+        delete this.tombstones[path];
+        this.scheduleStateSave();
+    }
+
+    public isPathSyncable(path: string): boolean {
+        // Evaluate the rules against the normalised path. Every check below is a prefix
+        // comparison, so './.obsidian/plugins/x' would otherwise slip past the '.obsidian/'
+        // guard while still resolving into the config folder — and '../' would escape the
+        // vault entirely. sanitizeVaultPath rejects the latter outright.
+        const safePath = sanitizeVaultPath(path);
+        if (safePath === null) {
+            this.log(`Rejected unsafe path: ${JSON.stringify(path)}`);
+            return false;
+        }
+        path = safePath;
+
         // Use cached arrays to avoid re-parsing on every vault event (invalidated on settings change)
         if (this._cachedExcludedFolders === null) {
             this._cachedExcludedFolders = this.settings.excludedFolders.split('\n').map(p => p.trim()).filter(Boolean);
@@ -4206,7 +4453,28 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
             port: port
         }; 
     }
-    public startDirectIpHost() { if (Platform.isMobile) return; this.reinitializeConnectionManager(); const pin = Array.from(window.crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join(''); this.directIpServer = new DirectIpServer(this, this.settings.directIpHostPort, pin); this.updateStatus(); return pin; }
+    /** Starts the offline host. Resolves with the access token, or null if it could not bind. */
+    public async startDirectIpHost(): Promise<string | null> {
+        if (Platform.isMobile) return null;
+        this.reinitializeConnectionManager();
+        const pin = Array.from(window.crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, '0')).join('');
+        const server = new DirectIpServer(this, this.settings.directIpHostPort, pin);
+        this.directIpServer = server;
+        try {
+            await server.listening;
+        } catch (e: any) {
+            this.directIpServer = null;
+            this.updateStatus();
+            this.showNotice(e?.message || 'Could not start the offline host.', 'error');
+            return null;
+        }
+        // Re-announce now the port is known. getMyPeerInfo() only fills in a port once
+        // directIpServer is set, and reinitializeConnectionManager above broadcast before
+        // that — leaving peers with a cached beacon advertising no port at all.
+        if (!Platform.isMobile) this.lanDiscovery.startBroadcasting(this.getMyPeerInfo());
+        this.updateStatus();
+        return pin;
+    }
     public async connectToDirectIpHost(config: DirectIpConfig) {
         this.reinitializeConnectionManager();
         this.directIpClient = new DirectIpClient(this, config);
@@ -4246,7 +4514,16 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
         }
         if (this.getConnectionMode() === 'direct-ip') {
             const isAuto = this.settings.syncMode === 'auto';
-            if (this.directIpServer) return { text: isAuto ? "Hosting Offline" : "Host Mode", icon: "server", state: 'success' };
+            if (this.directIpServer) {
+                const clientCount = this.directIpServer.getClients().length;
+                return {
+                    text: clientCount > 0
+                        ? `Hosting (${clientCount} device${clientCount > 1 ? 's' : ''})`
+                        : 'Hosting — waiting for devices',
+                    icon: "server",
+                    state: 'success'
+                };
+            }
             if (this.directIpClient) {
                 const client = this.directIpClient;
                 // Fatal error (e.g. PIN rejection) — non-recoverable
@@ -4264,7 +4541,7 @@ export default class ObsidianDecentralizedPlugin extends Plugin {
                 // Confirmed live connection
                 return { text: isAuto ? 'Connected Offline' : 'Client Mode', icon: 'smartphone', state: 'success' };
             }
-            return { text: isAuto ? "Offline Mode" : "Offline Mode", icon: "network", state: 'neutral' };
+            return { text: "Offline Mode", icon: "network", state: 'neutral' };
         }
         if (!this.peer || this.peer.disconnected) return { text: "Sync Offline", icon: "wifi-off", state: 'error' };
         if (!this.peer.id) return { text: "Connecting...", icon: "plug", spin: true, state: 'loading' };

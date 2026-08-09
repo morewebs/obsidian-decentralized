@@ -1,6 +1,6 @@
 // @ts-ignore
 import * as pako from 'pako';
-import { SyncError, SyncErrorCategory } from './types';
+import { SyncError, SyncErrorCategory, SyncTask } from './types';
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -20,9 +20,37 @@ export function compressText(content: string): ArrayBuffer {
     }
 }
 
-export function decompressText(data: ArrayBuffer): string {
+/**
+ * Ceiling on what a single compressed payload may expand to. DEFLATE reaches roughly
+ * 1000:1, so without a cap a few megabytes from a peer inflate to gigabytes and take the
+ * app down. 256 MB is far above any real note or attachment we compress.
+ */
+export const MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024;
+
+export function decompressText(data: ArrayBuffer, maxBytes: number = MAX_DECOMPRESSED_BYTES): string {
     try {
-        return pako.inflate(new Uint8Array(data), { to: 'string' });
+        // pako has no output-size option, so inflate in chunks and stop as soon as the
+        // running total crosses the limit rather than after the allocation has happened.
+        const inflater = new pako.Inflate({ to: 'string' });
+        let total = 0;
+        let overflowed = false;
+        (inflater as any).onData = function (chunk: string) {
+            total += chunk.length;
+            if (total > maxBytes) {
+                overflowed = true;
+                return;
+            }
+            (this as any).chunks.push(chunk);
+        };
+        inflater.push(new Uint8Array(data), true);
+
+        if (overflowed) {
+            throw new Error(`decompressed payload exceeds the ${Math.round(maxBytes / (1024 * 1024))} MB limit`);
+        }
+        if (inflater.err) {
+            throw new Error(inflater.msg || `inflate error ${inflater.err}`);
+        }
+        return (inflater.result as string) ?? '';
     } catch (err: any) {
         throw new SyncError(
             SyncErrorCategory.INTEGRITY_ERROR,
@@ -31,6 +59,43 @@ export function decompressText(data: ArrayBuffer): string {
             'The transferred file data might be corrupted. Please re-sync.'
         );
     }
+}
+
+/**
+ * Normalises a vault-relative path that came from a peer and rejects anything that could
+ * escape the vault or slip past the folder filters.
+ *
+ * The filters elsewhere are prefix comparisons, so `./.obsidian/plugins/x` did not match a
+ * `.obsidian/` check while still resolving into the config directory — enough to overwrite
+ * plugin code. Returns null when the path is not safe to use.
+ */
+export function sanitizeVaultPath(rawPath: unknown): string | null {
+    if (typeof rawPath !== 'string') return null;
+
+    // Backslashes are path separators on Windows; normalise so one syntax is validated.
+    let path = rawPath.replace(/\\/g, '/');
+
+    if (path.length === 0 || path.length > 1024) return null;
+    if (path.includes('\0')) return null;
+    // Absolute POSIX paths, Windows drive letters, and UNC paths.
+    if (path.startsWith('/') || /^[a-zA-Z]:/.test(path) || path.startsWith('//')) return null;
+
+    const segments: string[] = [];
+    for (const segment of path.split('/')) {
+        // Collapse empty segments (from `a//b`) and `.` rather than rejecting outright:
+        // they are meaningless but not hostile.
+        if (segment === '' || segment === '.') continue;
+        // `..` is never resolved, only rejected — resolving it would let a peer probe how
+        // deep the path is and still climb out of any folder it was restricted to.
+        if (segment === '..') return null;
+        // Trailing dots and spaces are stripped by Windows, so `foo.md ` and `foo.md`
+        // address the same file while comparing as different strings.
+        if (segment !== segment.replace(/[. ]+$/, '')) return null;
+        segments.push(segment);
+    }
+
+    if (segments.length === 0) return null;
+    return segments.join('/');
 }
 
 export function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -140,14 +205,25 @@ export function splitBinaryPayload(msg: any): { header: any; body: Uint8Array | 
 
     const { [field]: _omitted, ...header } = msg;
     const body = value instanceof Uint8Array ? value : new Uint8Array(value);
+    // An empty body is indistinguishable from "no body at all" once framed, because the
+    // frame carries only a header length. Without this marker a 0-byte file arrived with an
+    // undefined content field and the receiver threw on createBinary(path, undefined).
+    if (body.byteLength === 0) header.__emptyBody = true;
     return { header, body };
 }
 
 /** Reattach a binary body to the field its message type expects. */
 export function joinBinaryPayload(header: any, body: ArrayBuffer | null): any {
-    if (!body || !header || typeof header !== 'object') return header;
+    if (!header || typeof header !== 'object') return header;
     const field = BINARY_BODY_FIELD[header.type];
-    if (field) header[field] = body;
+    if (!field) return header;
+
+    if (header.__emptyBody) {
+        delete header.__emptyBody;
+        header[field] = new ArrayBuffer(0);
+        return header;
+    }
+    if (body) header[field] = body;
     return header;
 }
 
@@ -189,6 +265,23 @@ export function unpackFrame(buffer: ArrayBuffer): { header: any; body: ArrayBuff
     const bodyStart = 4 + headerLen;
     const body = bodyStart < buffer.byteLength ? buffer.slice(bodyStart) : null;
     return { header, body };
+}
+
+/**
+ * Stable identity for a queued task, so re-queueing the same work for the same peer
+ * coalesces instead of piling up. QueueManager dedups on this id and drops duplicates
+ * silently, so anything that must not collapse has to be distinguishable here.
+ *
+ * NUL is the field separator: it is the one byte that cannot appear in a vault path.
+ */
+export function taskQueueId(peerId: string | null, task: SyncTask): string {
+    // A batch is flushed in several chunks that all share one batchId, so the paths have to
+    // be part of the id. Keying on batchId alone made every flush after the first a
+    // duplicate, and those files were silently never sent.
+    const target = task.taskType === 'send-rename'
+        ? `${task.oldPath}\0${task.newPath}`
+        : (task.taskType === 'send-file-batch' ? `${task.batchId}\0${task.paths.join('\0')}` : task.path);
+    return `${peerId || '*'}\0${task.taskType}\0${target}`;
 }
 
 export interface PackedFile {

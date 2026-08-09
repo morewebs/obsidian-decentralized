@@ -10,7 +10,11 @@ Object.defineProperty(global, 'window', {
 });
 
 import { DirectIpServer, DirectIpClient } from './directip';
-import MockWebSocket from './__mocks__/ws';
+
+// Pull the mock class out of the mocked module rather than importing __mocks__/ws directly.
+// Loading that file as its own module as well as through jest.mock('ws') registers it twice,
+// and the duplicate registration makes DirectIpServer's dynamic `import('ws')` never settle.
+const MockWebSocket: any = jest.requireMock('ws').WebSocket;
 (global as any).WebSocket = MockWebSocket;
 
 describe('DirectIpServer', () => {
@@ -18,8 +22,10 @@ describe('DirectIpServer', () => {
     let mockPlugin: any;
 
 
-    beforeEach(() => {
-        jest.useFakeTimers();
+    beforeEach(async () => {
+        // queueMicrotask must stay real: the ws mock uses it to signal that the server is
+        // bound, and DirectIpServer.start() awaits that before resolving.
+        jest.useFakeTimers({ doNotFake: ['queueMicrotask'] });
         mockPlugin = {
             log: jest.fn(),
             showNotice: jest.fn(),
@@ -27,6 +33,9 @@ describe('DirectIpServer', () => {
             settings: { deviceId: 'test-device' }
         };
         server = new DirectIpServer(mockPlugin, 8080, '1234');
+        // start() is async now — it dynamically imports 'ws' and waits for the socket to
+        // actually bind — so wait for it before inspecting the server.
+        await server.listening;
     });
 
     afterEach(() => {
@@ -122,6 +131,10 @@ describe('DirectIpClient', () => {
     });
 
     test('send() should cap the buffer at 100 items', () => {
+        // This is about what happens while the link is down, so state that precondition
+        // rather than relying on whether the mock socket happens to look open.
+        (client as any).ws = null;
+
         for (let i = 0; i < 150; i++) {
             client.send({ type: 'test', index: i }).catch(() => {});
         }

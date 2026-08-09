@@ -4,7 +4,7 @@ import DiffMatchPatch from 'diff-match-patch';
 import type * as QRCodeType from 'qrcode';
 import type { Html5Qrcode as Html5QrcodeType } from 'html5-qrcode';
 import type ObsidianDecentralizedPlugin from './main';
-import { PeerInfo } from './types';
+import { PeerInfo, describeSyncPhase } from './types';
 
 // The QR generator and scanner together account for over half the bundle, yet they
 // are only reachable from the pairing modal. Importing them dynamically keeps their
@@ -69,10 +69,9 @@ export class ConnectionModal extends Modal {
             }
         }
         
-        if (!this.plugin.activePsk) {
-            this.plugin.activePsk = await this.plugin.generatePSK();
-        }
-        this.activePsk = this.plugin.activePsk;
+        // Opening this modal is what puts the device into pairing mode, so (re)start the
+        // window here rather than leaving auto-enrolment armed for the whole session.
+        this.activePsk = await this.plugin.beginPairingWindow();
         
         this.render();
     }
@@ -166,12 +165,25 @@ export class ConnectionModal extends Modal {
         const parts = scannedId.split('|');
         const peerId = this.normalizePairingCodeInput(parts[0]);
         const psk = parts[1];
-        
+
         if (psk) {
+            // Validate before storing. A malformed key used to be written straight into
+            // settings and only failed later, deep inside getCryptoKey, on every message.
+            if (!/^[A-Za-z0-9+/]{40,}={0,2}$/.test(psk)) {
+                this.statusState = 'error';
+                this.statusMessage = 'That pairing code looks damaged. Copy it again from the other device.';
+                this.render();
+                return;
+            }
             this.plugin.settings.peerKeys[peerId] = psk;
             await this.plugin.saveSettings();
+        } else {
+            this.plugin.showNotice(
+                'Connecting without an encryption key — this device ID was entered on its own. Use the full copied code or the QR to encrypt the link.',
+                'warning'
+            );
         }
-        
+
         this.statusState = 'connecting';
         this.statusMessage = `Connecting to ${peerId}...`;
         this.render();
@@ -250,8 +262,13 @@ export class ConnectionModal extends Modal {
             copyBtn.setText('Copied!');
             setTimeout(() => copyBtn.setText('Copy'), 2000);
         };
-        
-        contentEl.createDiv({ text: 'Type this code on your other device to connect', cls: 'od-instruction-text' });
+
+        // The code on screen is only the device ID; Copy puts the device ID *and* the
+        // encryption key on the clipboard. Say so — users were being told to share it.
+        contentEl.createDiv({
+            text: 'Press Copy and paste the result on your other device. The copied code contains this vault\'s encryption key, so treat it like a password — anyone who has it can pair with you.',
+            cls: 'od-instruction-text'
+        });
         
         const qrSection = contentEl.createDiv({ cls: 'od-qr-section' });
         qrSection.createDiv({ text: 'Or scan QR code (Includes Encryption Key)', cls: 'od-qr-label' });
@@ -365,15 +382,35 @@ export class ConnectionModal extends Modal {
         container.createDiv({ cls: 'od-section-title', text: 'Step 1: Host a Network (Main device)' });
         if (!Platform.isMobile) {
             const hostBtn = container.createEl('button', { text: 'Start Hosting', cls: 'mod-cta od-full-width' });
-            hostBtn.onclick = () => {
-                const pin = this.plugin.startDirectIpHost();
-                if (pin) {
-                    contentEl.empty();
-                    contentEl.createEl('h2', { text: 'Hosting Active', cls: 'od-dashboard-header' });
-                    contentEl.createDiv({ text: `IP: ${this.plugin.getLocalIp()}`, cls: 'od-ip-display' });
-                    contentEl.createDiv({ text: `Token: ${pin}`, cls: 'od-pin-display', attr: { style: 'font-size: 1.2em; word-break: break-all;' } });
-                    contentEl.createEl('button', { text: 'Done', cls: 'od-full-width', attr: { style: 'margin-top: 20px;' } }).onclick = () => this.close();
+            hostBtn.onclick = async () => {
+                hostBtn.disabled = true;
+                hostBtn.setText('Starting…');
+                let pin: string | null = null;
+                try {
+                    pin = await this.plugin.startDirectIpHost();
+                } finally {
+                    hostBtn.disabled = false;
+                    hostBtn.setText('Start Hosting');
                 }
+                // A null token means the socket never bound; startDirectIpHost has already
+                // explained why, so don't paint a "Hosting Active" screen over the failure.
+                if (!pin) return;
+
+                const ip = this.plugin.getLocalIp();
+                contentEl.empty();
+                contentEl.createEl('h2', { text: 'Hosting Active', cls: 'od-dashboard-header' });
+                contentEl.createDiv({
+                    text: ip ? `IP: ${ip}` : 'No network address found — check that you are connected to Wi-Fi or Ethernet.',
+                    cls: 'od-ip-display'
+                });
+                contentEl.createDiv({ text: `Token: ${pin}`, cls: 'od-pin-display od-token' });
+                const copyBtn = contentEl.createEl('button', { text: 'Copy token', cls: 'od-full-width od-spaced-top' });
+                copyBtn.onclick = async () => {
+                    await navigator.clipboard.writeText(pin!);
+                    copyBtn.setText('Copied');
+                    setTimeout(() => copyBtn.setText('Copy token'), 1500);
+                };
+                contentEl.createEl('button', { text: 'Done', cls: 'od-full-width od-spaced-top' }).onclick = () => this.close();
             };
         } else {
             container.createDiv({ text: 'Hosting is not available on mobile.', cls: 'od-text-muted' });
@@ -570,14 +607,6 @@ export class ConflictCenter {
             if (!badge) {
                 badge = document.createElement('span');
                 badge.className = 'od-conflict-badge';
-                badge.style.position = 'absolute';
-                badge.style.top = '0';
-                badge.style.right = '0';
-                badge.style.background = 'red';
-                badge.style.color = 'white';
-                badge.style.borderRadius = '50%';
-                badge.style.padding = '2px 6px';
-                badge.style.fontSize = '0.7em';
                 this.ribbonEl.style.position = 'relative';
                 this.ribbonEl.appendChild(badge);
             }
@@ -670,11 +699,8 @@ export class ConflictResolutionModal extends Modal {
         for (const [op, text] of diff) {
             const span = diffEl.createSpan();
             span.setText(text);
-            if (op === 1) span.style.background = '#e6ffed';
-            if (op === -1) {
-                span.style.background = '#ffeef0';
-                span.style.textDecoration = 'line-through';
-            }
+            if (op === 1) span.addClass('od-diff-insert');
+            if (op === -1) span.addClass('od-diff-delete');
         }
         new Setting(contentEl)
             .addButton(btn => btn.setButtonText('Keep My Version').onClick(() => {
@@ -708,6 +734,34 @@ export class BinaryConflictResolutionModal extends Modal {
         }));
     }
     
+    onClose() {
+        this.contentEl.empty();
+    }
+}
+
+/**
+ * Confirmation prompt for actions that cannot be undone. The settings tab puts several of
+ * these behind bare icon buttons, where a single stray click used to disconnect or forget a
+ * device with no way back.
+ */
+export class ConfirmModal extends Modal {
+    constructor(
+        app: App,
+        private opts: { title: string; body: string; confirmText: string; onConfirm: () => void }
+    ) { super(app); }
+
+    onOpen() {
+        const { contentEl } = this;
+        contentEl.createEl('h2', { text: this.opts.title });
+        contentEl.createEl('p', { text: this.opts.body });
+        new Setting(contentEl)
+            .addButton(btn => btn.setButtonText('Cancel').onClick(() => this.close()))
+            .addButton(btn => btn.setButtonText(this.opts.confirmText).setWarning().onClick(() => {
+                this.close();
+                this.opts.onConfirm();
+            }));
+    }
+
     onClose() {
         this.contentEl.empty();
     }
@@ -776,7 +830,7 @@ export class SyncProgressModal extends Modal {
         if (isSyncing) {
             this.container.createEl('h4', { text: 'Full Sync Progress', attr: { style: 'margin-top: 0;' } });
             const item = this.container.createDiv({ cls: 'od-transfer-item' });
-            item.createDiv({ text: `Phase: ${this.plugin.syncState.currentPhase}`, attr: { style: 'font-weight: bold; margin-bottom: 8px;' } });
+            item.createDiv({ text: describeSyncPhase(this.plugin.syncState.currentPhase), cls: 'od-phase-label' });
             
             if (this.plugin.syncState.filesTotal > 0) {
                 item.createEl('progress', { attr: { value: this.plugin.syncState.filesTransferred, max: this.plugin.syncState.filesTotal } });
