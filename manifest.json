@@ -1,7 +1,7 @@
 {
   "id": "obsidian-decentralized",
   "name": "Obsidian Decentralized",
-  "version": "3.0.0",
+  "version": "2.9.11-preview",
   "minAppVersion": "1.8.3",
   "description": "Peer-to-peer vault sync with no cloud storage. Notes transfer directly between your devices; a public signaling server is used only to introduce them, and Offline Mode skips it entirely.",
   "author": "moreweb",
