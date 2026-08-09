@@ -141,3 +141,6 @@ main.js
 .agents/
 ORIGINAL_REQUEST.md
 PROJECT.md
+
+# Local tooling output
+graphify-out/

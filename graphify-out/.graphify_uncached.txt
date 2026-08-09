@@ -1,5 +1,0 @@
-C:\Users\W\Documents\GitHub\obsidian-decentralized\.agents\rules\graphify.md
-C:\Users\W\Documents\GitHub\obsidian-decentralized\.agents\workflows\graphify.md
-C:\Users\W\Documents\GitHub\obsidian-decentralized\.github\workflows\release.yml
-C:\Users\W\Documents\GitHub\obsidian-decentralized\README.md
-C:\Users\W\Documents\GitHub\obsidian-decentralized\git_log.txt
